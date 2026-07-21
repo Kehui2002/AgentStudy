@@ -1,1 +1,1 @@
-"""Reserved for ToolDefinition and callable metadata in stage two."""
+"""为第二阶段的 ToolDefinition 和可调用对象元数据预留。"""

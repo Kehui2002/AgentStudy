@@ -1,4 +1,4 @@
-"""Deterministic model used by examples and tests."""
+"""供示例和测试使用的确定性模型。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .base import Model, ModelRequestParameters
 
 
 class FakeModel(Model):
-    """Always return the configured response and record every request."""
+    """始终返回预先配置的响应，并记录每一次请求。"""
 
     def __init__(self, response: str | ModelResponse = "This is a fake response.") -> None:
         self._response = ModelResponse(parts=[TextPart(response)]) if isinstance(response, str) else response
@@ -21,7 +21,7 @@ class FakeModel(Model):
         messages: list[ModelMessage],
         parameters: ModelRequestParameters,
     ) -> ModelResponse:
-        """Record inputs and return a defensive copy of the configured response."""
+        """记录输入，并返回预设响应的防御性副本。"""
         self.requests.append(deepcopy(messages))
         self.request_parameters.append(parameters)
         return deepcopy(self._response)

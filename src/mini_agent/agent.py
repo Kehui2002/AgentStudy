@@ -1,8 +1,7 @@
-"""The public Agent API.
+"""Agent 的公开 API。
 
-The public class intentionally delegates execution to ``AgentLoop``. Keeping the
-API and runtime separate makes it possible to replace the explicit loop with a
-node graph later without changing user code.
+公开类有意将执行过程委托给 ``AgentLoop``。将 API 与运行时分离后，未来可以在
+不修改用户代码的前提下，用节点图替换当前的显式循环。
 """
 
 from __future__ import annotations
@@ -18,11 +17,11 @@ from .runtime import AgentLoop
 
 
 class Agent:
-    """A minimal text-output agent.
+    """一个只输出文本的最小 Agent。
 
-    Args:
-        model: Model implementation used to generate a response.
-        max_steps: Safety limit for the number of model request steps in one run.
+    参数：
+        model: 用于生成响应的模型实现。
+        max_steps: 单次运行允许执行模型请求的最大步数，用作安全限制。
     """
 
     def __init__(self, model: Model, *, max_steps: int = 10) -> None:
@@ -35,7 +34,7 @@ class Agent:
         self._loop = AgentLoop()
 
     async def run(self, prompt: str) -> AgentResult[str]:
-        """Run the agent asynchronously and return its validated text result."""
+        """异步运行 Agent，并返回通过校验的文本结果。"""
         ctx = RunContext(
             model=self.model,
             prompt=prompt,
@@ -45,10 +44,9 @@ class Agent:
         return await self._loop.run(ctx)
 
     def run_sync(self, prompt: str) -> AgentResult[str]:
-        """Synchronous convenience wrapper around :meth:`run`.
+        """:meth:`run` 的同步便捷封装。
 
-        Like most ``run_sync`` APIs, this must not be called from an already
-        running event loop.
+        与大多数 ``run_sync`` API 一样，不能在已经运行的事件循环中调用它。
         """
         try:
             asyncio.get_running_loop()

@@ -1,4 +1,4 @@
-"""Model abstractions and test implementations."""
+"""模型抽象与测试用实现。"""
 
 from .base import Model, ModelRequestParameters
 from .fake import FakeModel

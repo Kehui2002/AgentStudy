@@ -1,1 +1,1 @@
-"""Function-tool support will be implemented in learning stage two."""
+"""函数工具支持将在第二学习阶段实现。"""

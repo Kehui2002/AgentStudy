@@ -1,4 +1,4 @@
-"""Per-run dependencies visible to the internal runtime."""
+"""内部运行时可见的单次运行依赖。"""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from .output import OutputSchema
 
 @dataclass(frozen=True, slots=True)
 class RunContext:
-    """Configuration and dependencies for one agent run.
+    """单次 Agent 运行所需的配置和依赖。
 
-    Mutable execution data belongs in ``AgentState`` rather than here.
+    可变的执行数据应放在 ``AgentState`` 中，而不是这里。
     """
 
     model: Model

@@ -29,7 +29,7 @@ class TextRunTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        # The model sees the history that existed before its own response.
+        # 模型只能看到生成本次响应之前已经存在的消息历史。
         self.assertEqual(
             model.requests,
             [[ModelRequest(parts=[UserPromptPart("question")])]],

@@ -1,1 +1,1 @@
-"""Reserved for tool argument validation, execution and retries in stage two."""
+"""为第二阶段的工具参数校验、执行和重试机制预留。"""

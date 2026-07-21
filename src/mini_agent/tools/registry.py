@@ -1,1 +1,1 @@
-"""Reserved for tool registration and name-conflict checks in stage two."""
+"""为第二阶段的工具注册和名称冲突检查预留。"""

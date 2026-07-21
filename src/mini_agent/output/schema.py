@@ -1,4 +1,4 @@
-"""Output parsing and validation."""
+"""输出解析与校验。"""
 
 from __future__ import annotations
 
@@ -12,16 +12,16 @@ OutputT = TypeVar("OutputT")
 
 
 class OutputSchema(ABC, Generic[OutputT]):
-    """Turn a normalized model response into the agent's public output."""
+    """将标准化的模型响应转换为 Agent 的公开输出。"""
 
     @abstractmethod
     def validate(self, response: ModelResponse) -> OutputT:
-        """Validate and return the final output."""
+        """校验并返回最终输出。"""
         raise NotImplementedError
 
 
 class TextOutputSchema(OutputSchema[str]):
-    """Accept a non-empty response containing text parts."""
+    """接收包含文本片段且不为空的响应。"""
 
     def validate(self, response: ModelResponse) -> str:
         if not response.parts:

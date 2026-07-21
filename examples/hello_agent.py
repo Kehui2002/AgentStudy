@@ -1,4 +1,4 @@
-"""Run the first-stage text agent without calling an external API."""
+"""在不调用外部 API 的情况下，运行第一阶段的文本 Agent。"""
 
 import asyncio
 

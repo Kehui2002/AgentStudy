@@ -1,4 +1,4 @@
-"""Provider-independent model interface."""
+"""与模型服务商无关的模型接口。"""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from ..messages import ModelMessage, ModelResponse
 
 @dataclass(frozen=True, slots=True)
 class ModelRequestParameters:
-    """Capabilities requested by the agent for the current model call."""
+    """Agent 在当前模型调用中要求启用的能力。"""
 
     allow_text_output: bool = True
 
 
 class Model(ABC):
-    """Abstract boundary between the agent runtime and a model provider."""
+    """Agent 运行时与模型服务商之间的抽象边界。"""
 
     @abstractmethod
     async def request(
@@ -24,5 +24,5 @@ class Model(ABC):
         messages: list[ModelMessage],
         parameters: ModelRequestParameters,
     ) -> ModelResponse:
-        """Return one normalized model response."""
+        """返回一个经过标准化的模型响应。"""
         raise NotImplementedError

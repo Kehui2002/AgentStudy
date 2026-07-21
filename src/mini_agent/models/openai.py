@@ -1,5 +1,4 @@
-"""Reserved for the provider-specific OpenAI adapter in a later stage.
+"""为后续阶段中 OpenAI 服务商专用的适配器预留。
 
-The core runtime must continue to depend only on ``models.base.Model`` when
-this adapter is implemented.
+实现此适配器时，核心运行时仍然只能依赖 ``models.base.Model``。
 """

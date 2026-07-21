@@ -1,14 +1,14 @@
-"""Usage counters accumulated during an agent run."""
+"""Agent 运行过程中累计的用量计数。"""
 
 from dataclasses import dataclass
 
 
 @dataclass(slots=True)
 class RunUsage:
-    """Minimal usage information for the first learning stage."""
+    """第一学习阶段使用的最小用量信息。"""
 
     requests: int = 0
 
     def copy(self) -> "RunUsage":
-        """Return an independent snapshot for the public result."""
+        """为公开结果返回一份独立的状态快照。"""
         return RunUsage(requests=self.requests)

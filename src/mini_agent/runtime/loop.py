@@ -1,4 +1,4 @@
-"""The explicit agent loop used in learning stage one."""
+"""第一学习阶段使用的显式 Agent 循环。"""
 
 from __future__ import annotations
 
@@ -11,15 +11,14 @@ from .state import AgentState
 
 
 class AgentLoop:
-    """Drive model requests until an output schema produces a final result.
+    """持续驱动模型请求，直到输出模式生成最终结果。
 
-    Stage one only supports text output, so a valid first response ends the
-    loop. Later stages will add tool and retry branches that ``continue`` back
-    to the next model request.
+    第一阶段只支持文本输出，因此第一个有效响应就会结束循环。后续阶段会加入
+    工具调用和重试分支，通过 ``continue`` 进入下一次模型请求。
     """
 
     async def run(self, ctx: RunContext) -> AgentResult[str]:
-        """Execute one independent run using the supplied context."""
+        """使用传入的上下文执行一次相互独立的运行。"""
         if not ctx.prompt:
             raise UserError("prompt must not be empty in learning stage one")
 

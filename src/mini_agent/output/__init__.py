@@ -1,4 +1,4 @@
-"""Output schemas used to decide when an agent run is complete."""
+"""用于判断 Agent 运行何时完成的输出模式。"""
 
 from .schema import OutputSchema, TextOutputSchema
 

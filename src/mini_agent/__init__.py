@@ -1,4 +1,4 @@
-"""Public API for the mini agent learning project."""
+"""迷你 Agent 学习项目的公开 API。"""
 
 from .agent import Agent
 from .exceptions import AgentRunError, MiniAgentError, UnexpectedModelBehavior, UserError

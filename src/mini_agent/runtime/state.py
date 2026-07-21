@@ -1,4 +1,4 @@
-"""Mutable state owned by a single agent run."""
+"""由单次 Agent 运行独占的可变状态。"""
 
 from __future__ import annotations
 
@@ -11,16 +11,16 @@ from ..usage import RunUsage
 
 @dataclass(slots=True)
 class AgentState:
-    """State that changes as the agent loop advances."""
+    """随着 Agent 循环推进而变化的状态。"""
 
     message_history: list[ModelMessage] = field(default_factory=list)
     usage: RunUsage = field(default_factory=RunUsage)
     run_step: int = 0
 
     def append(self, message: ModelMessage) -> None:
-        """Append one request or response to the conversation history."""
+        """向对话历史追加一个请求或响应。"""
         self.message_history.append(message)
 
     def all_messages(self) -> list[ModelMessage]:
-        """Return an isolated history snapshot."""
+        """返回一份相互隔离的历史快照。"""
         return deepcopy(self.message_history)
