@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+.env
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+dist/
+build/
+*.egg-info/
+
+# Local agent tooling; not part of the learning project.
+.agents/
+.codex/
