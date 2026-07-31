@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from ..messages import ModelMessage, ModelResponse
+from ..tools import ToolDefinition
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,7 @@ class ModelRequestParameters:
     """Agent 在当前模型调用中要求启用的能力。"""
 
     allow_text_output: bool = True
+    tool_definitions: tuple[ToolDefinition, ...] = ()
 
 
 class Model(ABC):

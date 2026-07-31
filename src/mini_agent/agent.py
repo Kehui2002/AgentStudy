@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from .context import RunContext
 from .exceptions import UserError
@@ -14,24 +16,38 @@ from .models import Model
 from .output import TextOutputSchema
 from .result import AgentResult
 from .runtime import AgentLoop
+from .tools import ToolManager
 
 
 class Agent:
-    """一个只输出文本的最小 Agent。
+    """支持文本输出与同步或异步 Function Tool 的最小 Agent。
 
     参数：
         model: 用于生成响应的模型实现。
+        tools: 提供给模型选择并由 Agent Run 执行的 Python 函数。
         max_steps: 单次运行允许执行模型请求的最大步数，用作安全限制。
+        max_tool_retries: 单次运行允许模型修正 Tool Call 的最大次数。
     """
 
-    def __init__(self, model: Model, *, max_steps: int = 10) -> None:
+    def __init__(
+        self,
+        model: Model,
+        *,
+        tools: Sequence[Callable[..., Any]] = (),
+        max_steps: int = 10,
+        max_tool_retries: int = 2,
+    ) -> None:
         if max_steps < 1:
             raise UserError("max_steps must be at least 1")
+        if max_tool_retries < 0:
+            raise UserError("max_tool_retries must not be negative")
 
         self.model = model
         self.max_steps = max_steps
+        self.max_tool_retries = max_tool_retries
         self._output_schema = TextOutputSchema()
         self._loop = AgentLoop()
+        self._tool_manager = ToolManager(tools)
 
     async def run(self, prompt: str) -> AgentResult[str]:
         """异步运行 Agent，并返回通过校验的文本结果。"""
@@ -40,6 +56,8 @@ class Agent:
             prompt=prompt,
             output_schema=self._output_schema,
             max_steps=self.max_steps,
+            max_tool_retries=self.max_tool_retries,
+            tool_manager=self._tool_manager,
         )
         return await self._loop.run(ctx)
 

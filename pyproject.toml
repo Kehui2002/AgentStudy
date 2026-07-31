@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "A small agent framework built for learning the Pydantic AI call chain"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "httpx[socks]>=0.27,<1",
+    "pydantic>=2.12,<3",
+]
+
+[project.scripts]
+origin-fit = "origin_fit.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

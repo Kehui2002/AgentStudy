@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .models import Model
 from .output import OutputSchema
+from .tools import ToolManager
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,3 +20,5 @@ class RunContext:
     prompt: str
     output_schema: OutputSchema[str]
     max_steps: int
+    max_tool_retries: int
+    tool_manager: ToolManager

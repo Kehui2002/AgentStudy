@@ -1,1 +1,6 @@
-"""函数工具支持将在第二学习阶段实现。"""
+"""Function Tool 的公开定义。"""
+
+from .definition import ToolDefinition
+from .manager import ToolManager
+
+__all__ = ("ToolDefinition", "ToolManager")

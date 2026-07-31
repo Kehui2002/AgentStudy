@@ -20,8 +20,26 @@ class TextPart:
     content: str
 
 
-ModelRequestPart: TypeAlias = UserPromptPart
-ModelResponsePart: TypeAlias = TextPart
+@dataclass(frozen=True, slots=True)
+class ToolCallPart:
+    """模型生成的一次 Function Tool 调用请求。"""
+
+    tool_call_id: str
+    tool_name: str
+    arguments_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultPart:
+    """返回给模型的一次 Tool Call 执行结果。"""
+
+    tool_call_id: str
+    content: str
+    is_error: bool
+
+
+ModelRequestPart: TypeAlias = UserPromptPart | ToolResultPart
+ModelResponsePart: TypeAlias = TextPart | ToolCallPart
 
 
 @dataclass(slots=True)
@@ -40,7 +58,7 @@ class ModelResponse:
     @property
     def text(self) -> str:
         """按照响应顺序拼接所有文本片段。"""
-        return "".join(part.content for part in self.parts)
+        return "".join(part.content for part in self.parts if isinstance(part, TextPart))
 
 
 ModelMessage: TypeAlias = ModelRequest | ModelResponse
