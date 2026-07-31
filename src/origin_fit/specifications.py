@@ -384,4 +384,24 @@ def inspect_persisted_object(store: LocalStore, object_id: str) -> dict | None:
                     "content_hash": row["content_hash"],
                     "approved_fit_recipe": json.loads(row["recipe_json"]),
                 }
+        if object_id.startswith("fit-result:"):
+            row = connection.execute(
+                "SELECT id, result_json FROM fit_results WHERE id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "fit_result_id": row["id"],
+                    "fit_result": json.loads(row["result_json"]),
+                }
+        if object_id.startswith("accepted-fit:"):
+            row = connection.execute(
+                "SELECT id, accepted_fit_json FROM accepted_fits WHERE id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "accepted_fit_id": row["id"],
+                    "accepted_fit": json.loads(row["accepted_fit_json"]),
+                }
     return None

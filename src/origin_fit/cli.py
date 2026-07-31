@@ -8,6 +8,7 @@ from typing import Sequence, TextIO
 
 from .datasets import ImportSelection, import_dataset, inspect_dataset
 from .errors import OriginFitError
+from .execution import accept_fit_result
 from .specifications import (
     approve_fit_specification,
     inspect_persisted_object,
@@ -59,6 +60,8 @@ def _parser() -> argparse.ArgumentParser:
 
     approve_parser = commands.add_parser("approve")
     approve_parser.add_argument("fit_specification_id")
+    accept_parser = commands.add_parser("accept")
+    accept_parser.add_argument("fit_result_id")
     return parser
 
 
@@ -129,11 +132,13 @@ def main(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> 
                 graph_profile_version=profile_version,
                 initial_values=_initial_values(arguments.initial_values),
             )
-        else:
+        elif arguments.command == "approve":
             result = approve_fit_specification(
                 store,
                 arguments.fit_specification_id,
             )
+        else:
+            result = accept_fit_result(store, arguments.fit_result_id)
         print(json.dumps(result, sort_keys=True), file=output)
         return 0
     except OriginFitError as error:

@@ -60,6 +60,34 @@ class LocalStore:
                     recipe_json TEXT NOT NULL,
                     FOREIGN KEY (fit_specification_id) REFERENCES fit_specifications(id)
                 );
+                CREATE TABLE IF NOT EXISTS fit_results (
+                    id TEXT PRIMARY KEY,
+                    dataset_snapshot_id TEXT NOT NULL,
+                    approved_fit_recipe_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    FOREIGN KEY (dataset_snapshot_id) REFERENCES dataset_snapshots(id),
+                    FOREIGN KEY (approved_fit_recipe_id) REFERENCES approved_fit_recipes(id)
+                );
+                CREATE TABLE IF NOT EXISTS fit_jobs (
+                    id TEXT PRIMARY KEY,
+                    dataset_snapshot_id TEXT NOT NULL,
+                    approved_fit_recipe_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    fit_result_id TEXT,
+                    FOREIGN KEY (dataset_snapshot_id) REFERENCES dataset_snapshots(id),
+                    FOREIGN KEY (approved_fit_recipe_id) REFERENCES approved_fit_recipes(id)
+                );
+                CREATE TABLE IF NOT EXISTS accepted_fits (
+                    id TEXT PRIMARY KEY,
+                    fit_result_id TEXT NOT NULL UNIQUE,
+                    accepted_by TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    accepted_fit_json TEXT NOT NULL,
+                    FOREIGN KEY (fit_result_id) REFERENCES fit_results(id)
+                );
                 """
             )
 
