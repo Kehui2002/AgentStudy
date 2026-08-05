@@ -332,6 +332,33 @@ class RemoteOriginExecutor:
                 "incompatible_worker",
                 "Worker capabilities are incompatible with the Approved Fit Recipe.",
             )
+        row_count = submission.dataset_summary.get("row_count")
+        y_columns = submission.dataset_metadata.get("y_columns")
+        try:
+            dataset_size = len(
+                base64.b64decode(submission.dataset_base64, validate=True)
+            )
+        except ValueError as error:
+            raise OriginFitError(
+                "dataset_integrity_error", "Dataset Snapshot upload is invalid."
+            ) from error
+        if (
+            dataset_size > capabilities.max_dataset_bytes
+            or (
+                capabilities.max_submission_bytes is not None
+                and len(submission.model_dump_json().encode("utf-8"))
+                > capabilities.max_submission_bytes
+            )
+            or isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count > capabilities.max_rows
+            or not isinstance(y_columns, list)
+            or len(y_columns) > capabilities.max_y_series
+        ):
+            raise OriginFitError(
+                "worker_limit_exceeded",
+                "Dataset Snapshot exceeds the negotiated Worker limits.",
+            )
 
     @staticmethod
     def _record_job(

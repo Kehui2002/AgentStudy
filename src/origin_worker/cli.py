@@ -4,12 +4,14 @@ import argparse
 import ipaddress
 import os
 from pathlib import Path
+import sqlite3
 from typing import Sequence
 
 from origin_fit.execution import DeterministicFakeOriginAdapter
 
 from .api import create_app
-from .service import OriginWorker
+from .originpro_adapter import OriginProAdapter, OriginProAdapterError
+from .service import OriginWorker, WorkerError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -23,6 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--certfile", required=True, type=Path)
     serve.add_argument("--keyfile", required=True, type=Path)
     serve.add_argument("--fake-origin", action="store_true")
+    serve.add_argument("--origin-visible", action="store_true")
     return parser
 
 
@@ -49,24 +52,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if not arguments.certfile.is_file() or not arguments.keyfile.is_file():
         raise SystemExit("Origin Worker TLS certificate and key must exist.")
+    if arguments.certfile.stat().st_size == 0 or arguments.keyfile.stat().st_size == 0:
+        raise SystemExit("Origin Worker TLS certificate and key must not be empty.")
     token = os.environ.get("ORIGIN_WORKER_TOKEN", "")
     if len(token) < 32:
         raise SystemExit("ORIGIN_WORKER_TOKEN must contain at least 32 characters.")
-    if not arguments.fake_origin:
+    if arguments.fake_origin and arguments.origin_visible:
+        raise SystemExit("--origin-visible cannot be combined with --fake-origin.")
+    state_reference = str(arguments.state_dir)
+    if (
+        state_reference.startswith(("\\\\", "//"))
+        or arguments.state_dir.is_symlink()
+        or (arguments.state_dir.exists() and not arguments.state_dir.is_dir())
+    ):
         raise SystemExit(
-            "This build only includes the Fake Origin Adapter; pass --fake-origin."
+            "Origin Worker state directory must be a local, non-symlink directory."
         )
+
+    adapter = None
+    try:
+        adapter = (
+            DeterministicFakeOriginAdapter()
+            if arguments.fake_origin
+            else OriginProAdapter(visible=arguments.origin_visible)
+        )
+        preflight = getattr(adapter, "preflight", None)
+        if callable(preflight):
+            preflight()
+        worker = OriginWorker(arguments.state_dir, adapter)
+        worker.health()
+    except (OSError, sqlite3.Error, OriginProAdapterError, WorkerError) as error:
+        terminate = getattr(adapter, "terminate", None)
+        if callable(terminate):
+            terminate()
+        raise SystemExit(
+            "Origin Worker state directory, SQLite, or Adapter preflight failed."
+        ) from error
 
     import uvicorn
 
-    worker = OriginWorker(arguments.state_dir, DeterministicFakeOriginAdapter())
-    worker.health()
     app = create_app(worker, bearer_token=token)
-    uvicorn.run(
-        app,
-        host=arguments.host,
-        port=arguments.port,
-        ssl_certfile=str(arguments.certfile),
-        ssl_keyfile=str(arguments.keyfile),
-    )
+    try:
+        uvicorn.run(
+            app,
+            host=arguments.host,
+            port=arguments.port,
+            ssl_certfile=str(arguments.certfile),
+            ssl_keyfile=str(arguments.keyfile),
+        )
+    finally:
+        terminate = getattr(adapter, "terminate", None)
+        if callable(terminate):
+            terminate()
     return 0

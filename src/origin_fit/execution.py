@@ -108,6 +108,8 @@ class OriginExecutionRequest:
     weighting: Literal["none", "instrument"]
     initialization: dict[str, object]
     series: tuple[OriginSeriesInput, ...]
+    x_unit: str = ""
+    y_units: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +477,8 @@ def load_approved_fit_execution_request(
         weighting=specification["weighting"]["mode"],
         initialization=specification["initialization"],
         series=series_inputs,
+        x_unit=specification["units"][specification["shared_x_column"]],
+        y_units={name: specification["units"][name] for name in y_names},
     )
     return request, exclusions, {item.series_name: len(item.x) for item in series_inputs}
 

@@ -450,6 +450,15 @@ class OriginFitExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.model, "ExpDec2")
             self.assertEqual((request.fit_minimum, request.fit_maximum), (0, 11))
             self.assertEqual(request.weighting, "none")
+            self.assertEqual(request.x_unit, "s")
+            self.assertEqual(
+                request.y_units,
+                {
+                    "decay_a": "dimensionless",
+                    "decay_b": "dimensionless",
+                    "decay_c": "dimensionless",
+                },
+            )
             self.assertEqual(request.initialization["mode"], "explicit")
             values_by_y = request.initialization["values_by_y"]
             assert isinstance(values_by_y, dict)

@@ -43,6 +43,7 @@ class WorkerCapabilities(StrictModel):
     max_dataset_bytes: int
     max_rows: int
     max_y_series: int
+    max_submission_bytes: int | None = None
 
 
 class WorkerSubmission(StrictModel):

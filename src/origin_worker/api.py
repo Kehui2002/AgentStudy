@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 import hmac
 from typing import Any
 
+from pydantic import ValidationError
+
 from origin_fit.contracts import WorkerSubmission
 
 from .service import OriginWorker, WorkerError
@@ -15,18 +17,24 @@ def create_app(
     *,
     bearer_token: str,
     cleanup_interval: float = 60 * 60,
+    max_upload_bytes: int | None = None,
 ) -> Any:
     """Create the optional FastAPI `/v1` transport adapter."""
     if not bearer_token:
         raise ValueError("Worker Bearer Token must not be empty")
     if cleanup_interval <= 0:
         raise ValueError("cleanup_interval must be positive")
+    if max_upload_bytes is None:
+        max_upload_bytes = worker.max_submission_bytes
+    if max_upload_bytes <= 0:
+        raise ValueError("max_upload_bytes must be positive")
     try:
         from fastapi import (  # type: ignore[import-not-found]
             Depends,
             FastAPI,
             Header,
             HTTPException,
+            Request,
             status,
         )
         from fastapi.responses import Response  # type: ignore[import-not-found]
@@ -34,6 +42,8 @@ def create_app(
         raise RuntimeError(
             "Install the 'origin-worker' extra to serve the Worker API."
         ) from error
+    # FastAPI resolves postponed annotations against module globals.
+    globals()["Request"] = Request
 
     @asynccontextmanager
     async def lifespan(app: Any):  # type: ignore[no-untyped-def]
@@ -97,10 +107,45 @@ def create_app(
 
     @app.post("/v1/jobs", status_code=status.HTTP_202_ACCEPTED)
     async def submit(
-        submission: WorkerSubmission,
+        request: Request,
         _: None = Depends(authenticate),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, object]:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = max_upload_bytes + 1
+            if declared_length > max_upload_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail={
+                        "code": "upload_too_large",
+                        "message": "Worker submission exceeds the upload limit.",
+                    },
+                )
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > max_upload_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail={
+                        "code": "upload_too_large",
+                        "message": "Worker submission exceeds the upload limit.",
+                    },
+                )
+            body.extend(chunk)
+        try:
+            submission = WorkerSubmission.model_validate_json(body, strict=True)
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "invalid_submission",
+                    "message": "Worker submission is invalid.",
+                },
+            ) from error
         try:
             job = worker.submit(submission, idempotency_key or "")
         except WorkerError as error:

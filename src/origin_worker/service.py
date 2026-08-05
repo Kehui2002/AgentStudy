@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import contextmanager
+import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -62,11 +64,27 @@ class OriginWorker:
         self.max_dataset_bytes = max_dataset_bytes
         self.max_rows = max_rows
         self.max_y_series = max_y_series
+        self.max_submission_bytes = ((max_dataset_bytes + 2) // 3) * 4 + 1024 * 1024
         self.job_timeout = job_timeout
         self.workspace_retention_days = workspace_retention_days
         self._queue_lock = asyncio.Lock()
         state_dir.mkdir(parents=True, exist_ok=True)
+        if state_dir.is_symlink():
+            raise WorkerError(
+                "invalid_workspace_root",
+                "Worker state directory must not be a symbolic link.",
+            )
+        if self.jobs_dir.is_symlink():
+            raise WorkerError(
+                "invalid_workspace_root",
+                "Worker jobs directory must not be a symbolic link.",
+            )
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        if self.jobs_dir.resolve().parent != state_dir.resolve():
+            raise WorkerError(
+                "invalid_workspace_root",
+                "Worker jobs directory must remain inside Worker state.",
+            )
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -158,6 +176,7 @@ class OriginWorker:
             max_dataset_bytes=self.max_dataset_bytes,
             max_rows=self.max_rows,
             max_y_series=self.max_y_series,
+            max_submission_bytes=self.max_submission_bytes,
         )
         with self.connect() as connection:
             self._audit(
@@ -219,34 +238,50 @@ class OriginWorker:
             ensure_ascii=False,
         )
         submitted_at = utc_now()
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO fit_jobs (
-                    id, idempotency_key, submission_hash, submission_json,
-                    status, submitted_at, workspace_ref
-                ) VALUES (?, ?, ?, ?, 'queued', ?, ?)
-                """,
-                (
+        try:
+            with self.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO fit_jobs (
+                        id, idempotency_key, submission_hash, submission_json,
+                        status, submitted_at, workspace_ref
+                    ) VALUES (?, ?, ?, ?, 'queued', ?, ?)
+                    """,
+                    (
+                        worker_job_id,
+                        idempotency_key,
+                        submission_hash,
+                        persisted_json,
+                        submitted_at,
+                        workspace_ref,
+                    ),
+                )
+                self._transition(connection, worker_job_id, "queued")
+                self._audit(
+                    connection,
+                    "fit_job.submitted",
                     worker_job_id,
-                    idempotency_key,
-                    submission_hash,
-                    persisted_json,
-                    submitted_at,
-                    workspace_ref,
-                ),
-            )
-            self._transition(connection, worker_job_id, "queued")
-            self._audit(
-                connection,
-                "fit_job.submitted",
-                worker_job_id,
-                {
-                    "dataset_snapshot_id": submission.dataset_snapshot_id,
-                    "approved_fit_recipe_id": submission.approved_fit_recipe_id,
-                    "submission_hash": submission_hash,
-                },
-            )
+                    {
+                        "dataset_snapshot_id": submission.dataset_snapshot_id,
+                        "approved_fit_recipe_id": submission.approved_fit_recipe_id,
+                        "submission_hash": submission_hash,
+                    },
+                )
+        except sqlite3.IntegrityError as error:
+            shutil.rmtree(workspace, ignore_errors=True)
+            with self.connect() as connection:
+                concurrent = connection.execute(
+                    "SELECT * FROM fit_jobs WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+            if concurrent is not None and concurrent["submission_hash"] == submission_hash:
+                return self._job(concurrent)
+            if concurrent is not None:
+                raise WorkerError(
+                    "idempotency_conflict",
+                    "The Idempotency-Key was already used for different content.",
+                ) from error
+            raise
         return self.get_job(worker_job_id)
 
     def get_job(self, worker_job_id: str) -> WorkerJob:
@@ -360,6 +395,12 @@ class OriginWorker:
                     "fit_job.cancelled",
                     worker_job_id,
                     {"while_running": True},
+                )
+                self._write_diagnostic(
+                    row["workspace_ref"],
+                    worker_job_id,
+                    "cancelled_during_execution",
+                    "Running Fit Job cancellation terminated execution.",
                 )
                 terminate = getattr(self.adapter, "terminate", None)
                 if callable(terminate):
@@ -497,6 +538,25 @@ class OriginWorker:
             or len(y_columns) > self.max_y_series
         ):
             raise WorkerError("dataset_too_large", "Dataset Snapshot exceeds Worker limits.")
+        try:
+            text = dataset.decode("utf-8")
+            reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+            headers = next(reader)
+            parsed_rows = 0
+            for parsed_rows, _ in enumerate(reader, start=1):
+                if parsed_rows > self.max_rows:
+                    raise WorkerError(
+                        "dataset_too_large",
+                        "Dataset Snapshot exceeds Worker limits.",
+                    )
+        except (UnicodeDecodeError, csv.Error, StopIteration) as error:
+            raise WorkerError(
+                "invalid_dataset", "Dataset Snapshot is not valid UTF-8 CSV."
+            ) from error
+        if any(name not in headers for name in y_columns):
+            raise WorkerError(
+                "invalid_dataset", "Dataset Snapshot does not contain every selected Y."
+            )
         return dataset
 
     def _start_next(self) -> str | None:
@@ -550,6 +610,10 @@ class OriginWorker:
             )
             adapter_name = getattr(self.adapter, "adapter_name", type(self.adapter).__name__)
             originpro_version = getattr(self.adapter, "originpro_version", "fake-2025")
+            graph_artifacts = None
+            take_artifacts = getattr(self.adapter, "take_artifacts", None)
+            if callable(take_artifacts):
+                graph_artifacts = take_artifacts()
             bundle, _ = build_result_bundle(
                 worker_job_id=worker_job_id,
                 request=request,
@@ -557,6 +621,7 @@ class OriginWorker:
                 submission=submission,
                 adapter_name=str(adapter_name),
                 originpro_version=str(originpro_version),
+                graph_artifacts=graph_artifacts,
             )
             bundle_hash = hashlib.sha256(bundle).hexdigest()
             bundle_path = workspace / "fit-result-bundle.zip"
@@ -584,24 +649,33 @@ class OriginWorker:
                     {"bundle_sha256": bundle_hash},
                 )
         except asyncio.TimeoutError:
-            terminate = getattr(self.adapter, "terminate", None)
-            if callable(terminate):
-                terminate()
+            self._terminate_if_running(worker_job_id)
             self._fail(
                 worker_job_id,
                 "worker_timeout",
                 "Fit Job exceeded the Worker execution timeout.",
             )
         except (OriginFitError, WorkerError, ValidationError) as error:
+            self._terminate_if_running(worker_job_id)
             code = getattr(error, "code", "invalid_submission")
             message = getattr(error, "message", "Worker rejected invalid job content.")
             self._fail(worker_job_id, str(code), str(message))
         except Exception:
+            self._terminate_if_running(worker_job_id)
             self._fail(
                 worker_job_id,
                 "worker_execution_error",
                 "Worker could not complete the Fit Job.",
             )
+
+    def _terminate_if_running(self, worker_job_id: str) -> None:
+        with self.connect() as connection:
+            current = connection.execute(
+                "SELECT status FROM fit_jobs WHERE id = ?", (worker_job_id,)
+            ).fetchone()
+        terminate = getattr(self.adapter, "terminate", None)
+        if current is not None and current["status"] == "running" and callable(terminate):
+            terminate()
 
     def _hydrate_workspace(
         self, workspace: Path, submission: WorkerSubmission
@@ -683,6 +757,32 @@ class OriginWorker:
                 worker_job_id,
                 {"error_code": code},
             )
+            workspace_ref = connection.execute(
+                "SELECT workspace_ref FROM fit_jobs WHERE id = ?", (worker_job_id,)
+            ).fetchone()["workspace_ref"]
+        self._write_diagnostic(workspace_ref, worker_job_id, code, message)
+
+    def _write_diagnostic(
+        self,
+        workspace_ref: str,
+        worker_job_id: str,
+        code: str,
+        message: str,
+    ) -> None:
+        diagnostic = json.dumps(
+            {
+                "schema_version": "1.0",
+                "worker_job_id": worker_job_id,
+                "occurred_at": utc_now(),
+                "error_code": code,
+                "message": message,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        path = self._workspace(workspace_ref) / "diagnostic.json"
+        path.write_bytes(diagnostic)
+        path.chmod(0o600)
 
     def _workspace(self, reference: str) -> Path:
         candidate = (self.state_dir / reference).resolve()

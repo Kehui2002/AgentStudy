@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Sequence, TextIO
 
+from mini_agent import DeepSeekModelProvider, MiniAgentError
+
+from .agent_cli import run_agent_cli
 from .datasets import ImportSelection, import_dataset, inspect_dataset
 from .errors import OriginFitError
 from .execution import accept_fit_result
+from .remote import HttpWorkerTransport, RemoteOriginExecutor
 from .specifications import (
     approve_fit_specification,
     inspect_persisted_object,
@@ -62,6 +68,11 @@ def _parser() -> argparse.ArgumentParser:
     approve_parser.add_argument("fit_specification_id")
     accept_parser = commands.add_parser("accept")
     accept_parser.add_argument("fit_result_id")
+
+    agent_parser = commands.add_parser("agent")
+    agent_parser.add_argument("--worker-url", required=True)
+    agent_parser.add_argument("--worker-certificate", required=True, type=Path)
+    agent_parser.add_argument("--deepseek-model", default=None)
     return parser
 
 
@@ -94,12 +105,69 @@ def _initial_values(path: Path | None) -> dict | None:
     return value
 
 
-def main(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> int:
+async def _run_configured_agent(
+    store: LocalStore,
+    arguments: argparse.Namespace,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> None:
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    worker_credential = os.environ.get("ORIGIN_WORKER_TOKEN")
+    if not api_key or not worker_credential:
+        raise OriginFitError(
+            "missing_configuration", "Required credentials are not configured."
+        )
+    model_options = (
+        {"model_name": arguments.deepseek_model}
+        if arguments.deepseek_model is not None
+        else {}
+    )
+    model = DeepSeekModelProvider(api_key, **model_options)
+    try:
+        transport = HttpWorkerTransport.with_pinned_certificate(
+            arguments.worker_url,
+            token=worker_credential,
+            pinned_certificate=arguments.worker_certificate,
+        )
+    except ValueError as error:
+        raise OriginFitError(
+            "invalid_worker_configuration", "Origin Worker configuration is invalid."
+        ) from error
+    try:
+        await run_agent_cli(
+            store,
+            model,
+            RemoteOriginExecutor(transport),
+            stdin=stdin,
+            stdout=stdout,
+        )
+    finally:
+        await transport.aclose()
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+) -> int:
+    input_stream = stdin or sys.stdin
     output = stdout or sys.stdout
     try:
         arguments = _parser().parse_args(argv)
         store = LocalStore(arguments.state_dir)
         result: dict
+        if arguments.command == "agent":
+            asyncio.run(
+                _run_configured_agent(
+                    store,
+                    arguments,
+                    stdin=input_stream,
+                    stdout=output,
+                )
+            )
+            return 0
         if arguments.command == "import":
             result = import_dataset(
                 store,
@@ -144,6 +212,30 @@ def main(argv: Sequence[str] | None = None, *, stdout: TextIO | None = None) -> 
     except OriginFitError as error:
         print(
             json.dumps({"error": error.code, "message": error.message}, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 2
+    except MiniAgentError:
+        print(
+            json.dumps(
+                {
+                    "error": "agent_run_failed",
+                    "message": "Agent Run failed; check controlled local diagnostics.",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    except Exception:
+        print(
+            json.dumps(
+                {
+                    "error": "internal_error",
+                    "message": "The command failed without exposing internal diagnostics.",
+                },
+                sort_keys=True,
+            ),
             file=sys.stderr,
         )
         return 2

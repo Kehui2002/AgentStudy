@@ -5,7 +5,7 @@ import hashlib
 import io
 import json
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import zipfile
 
 from origin_fit.contracts import (
@@ -23,6 +23,9 @@ from origin_fit.contracts import (
 )
 from origin_fit.execution import FitResult, OriginExecutionRequest
 from origin_fit.storage import utc_now
+
+if TYPE_CHECKING:
+    from .originpro_adapter import OriginGraphArtifacts
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -93,11 +96,31 @@ def build_result_bundle(
     submission: WorkerSubmission,
     adapter_name: str,
     originpro_version: str,
+    graph_artifacts: OriginGraphArtifacts | None = None,
 ) -> tuple[bytes, FitResultManifest]:
     approved_fit_recipe = submission.approved_fit_recipe
     specification = approved_fit_recipe["fit_specification"]
     fitted_data, residuals = _data_artifacts(request, result)
-    png, pdf, opju = _fake_graph_artifacts(result)
+    if adapter_name.startswith("originpro-2025-adapter/") and graph_artifacts is None:
+        raise ValueError(
+            "The Production Origin Adapter did not provide graph artifacts."
+        )
+    if graph_artifacts is None:
+        png, pdf, opju = _fake_graph_artifacts(result)
+    else:
+        expected_profile = (
+            f"{specification['graph_profile']['id']}@"
+            f"{specification['graph_profile']['version']}"
+        )
+        if graph_artifacts.graph_profile != expected_profile:
+            raise ValueError(
+                "Origin graph artifacts do not match the approved profile."
+            )
+        png, pdf, opju = (
+            graph_artifacts.png,
+            graph_artifacts.pdf,
+            graph_artifacts.opju,
+        )
     exclusions = _csv_bytes(
         ["series_name", "row_number", "reason"],
         [
