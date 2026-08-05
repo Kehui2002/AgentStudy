@@ -404,4 +404,47 @@ def inspect_persisted_object(store: LocalStore, object_id: str) -> dict | None:
                     "accepted_fit_id": row["id"],
                     "accepted_fit": json.loads(row["accepted_fit_json"]),
                 }
+        if object_id.startswith("fit-archive:"):
+            row = connection.execute(
+                """
+                SELECT id, dataset_snapshot_id, approved_fit_recipe_id,
+                       worker_job_id, fit_result_id, bundle_hash,
+                       archived_at, manifest_json
+                FROM fit_archives WHERE id = ?
+                """,
+                (object_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "fit_archive_id": row["id"],
+                    "dataset_snapshot_id": row["dataset_snapshot_id"],
+                    "approved_fit_recipe_id": row["approved_fit_recipe_id"],
+                    "worker_job_id": row["worker_job_id"],
+                    "fit_result_id": row["fit_result_id"],
+                    "bundle_sha256": row["bundle_hash"],
+                    "archived_at": row["archived_at"],
+                    "manifest": json.loads(row["manifest_json"]),
+                }
+        if object_id.startswith("fit-job:"):
+            row = connection.execute(
+                """
+                SELECT worker_job_id, dataset_snapshot_id,
+                       approved_fit_recipe_id, status, submitted_at,
+                       updated_at, error_code, bundle_hash, fit_archive_id
+                FROM worker_job_mappings WHERE worker_job_id = ?
+                """,
+                (object_id,),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "worker_job_id": row["worker_job_id"],
+                    "dataset_snapshot_id": row["dataset_snapshot_id"],
+                    "approved_fit_recipe_id": row["approved_fit_recipe_id"],
+                    "status": row["status"],
+                    "submitted_at": row["submitted_at"],
+                    "updated_at": row["updated_at"],
+                    "error_code": row["error_code"],
+                    "bundle_sha256": row["bundle_hash"],
+                    "fit_archive_id": row["fit_archive_id"],
+                }
     return None

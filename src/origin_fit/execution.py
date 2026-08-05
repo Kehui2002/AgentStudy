@@ -148,6 +148,9 @@ class OriginAdapter(Protocol):
 class FakeOriginAdapter:
     """Deterministic Origin execution seam for Linux tests."""
 
+    adapter_name = "fake-origin-adapter/1.0"
+    originpro_version = "fake-originpro-2025"
+
     def __init__(self, responses: list[OriginSeriesResponse]) -> None:
         self._responses = tuple(responses)
         self.requests: list[OriginExecutionRequest] = []
@@ -159,7 +162,58 @@ class FakeOriginAdapter:
         return self._responses
 
 
-def _load_execution_request(
+class DeterministicFakeOriginAdapter:
+    """Data-derived Fake Adapter for demos that never claims real Origin coverage."""
+
+    adapter_name = "deterministic-fake-origin-adapter/1.0"
+    originpro_version = "fake-originpro-2025"
+
+    def __init__(self) -> None:
+        self.requests: list[OriginExecutionRequest] = []
+
+    async def execute(
+        self, request: OriginExecutionRequest
+    ) -> tuple[OriginSeriesResponse, ...]:
+        self.requests.append(request)
+        responses: list[OriginSeriesResponse] = []
+        span = request.fit_maximum - request.fit_minimum
+        for series in request.series:
+            baseline = min(series.y)
+            amplitude = max(series.y) - baseline
+            parameters = {
+                "y0": baseline,
+                "A1": max(amplitude * 0.6, 1e-12),
+                "t1": max(span / 6, 1e-12),
+                "A2": max(amplitude * 0.4, 1e-12),
+                "t2": max(span / 2, 2e-12),
+            }
+            errors = {
+                name: max(abs(value) * 0.01, 1e-12)
+                for name, value in parameters.items()
+            }
+            responses.append(
+                OriginSeriesResponse(
+                    series_name=series.series_name,
+                    converged=True,
+                    raw_parameters=parameters,
+                    standard_errors=errors,
+                    confidence_intervals={
+                        name: (value - 1.96 * errors[name], value + 1.96 * errors[name])
+                        for name, value in parameters.items()
+                    },
+                    covariance=[
+                        [1.0 if row == column else 0.0 for column in range(5)]
+                        for row in range(5)
+                    ],
+                    correlations={},
+                    fit_statistics={"fake_objective": 0.0},
+                    actual_initial_values=parameters,
+                )
+            )
+        return tuple(responses)
+
+
+def load_approved_fit_execution_request(
     store: LocalStore,
     snapshot_id: str,
     recipe_id: str,
@@ -537,11 +591,13 @@ async def execute_approved_fit(
     dataset_snapshot_id: str,
     approved_fit_recipe_id: str,
     adapter: OriginAdapter,
+    *,
+    fit_job_id: str | None = None,
 ) -> FitResult:
-    request, exclusions, valid_counts = _load_execution_request(
+    request, exclusions, valid_counts = load_approved_fit_execution_request(
         store, dataset_snapshot_id, approved_fit_recipe_id
     )
-    fit_job_id = f"fit-job:{uuid.uuid4()}"
+    fit_job_id = fit_job_id or f"fit-job:{uuid.uuid4()}"
     with store.connect() as connection:
         connection.execute(
             """

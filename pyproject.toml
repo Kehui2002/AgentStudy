@@ -13,8 +13,13 @@ dependencies = [
     "pydantic>=2.12,<3",
 ]
 
+[project.optional-dependencies]
+origin-client = ["httpx[socks]>=0.27,<1"]
+origin-worker = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+
 [project.scripts]
 origin-fit = "origin_fit.cli:main"
+origin-worker = "origin_worker.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
