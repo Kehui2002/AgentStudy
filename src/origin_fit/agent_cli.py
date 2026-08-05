@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import csv
+from dataclasses import dataclass
 import json
 import shlex
 from typing import Literal, Protocol, TextIO
@@ -158,7 +159,15 @@ def _agent_prompt(
 
 
 def _compressed_result(result: FitResult) -> dict:
-    statistic_names = ("r_squared", "reduced_chi_square", "sse", "dof")
+    statistic_names = (
+        "origin_reduced_chi_square",
+        "degrees_of_freedom",
+        "residual_sum_of_squares",
+        "adjusted_r_squared",
+        "r_squared",
+        "root_mean_square_error",
+        "iteration_count",
+    )
     return {
         "fit_result_id": result.fit_result_id,
         "classification": result.classification,
@@ -181,230 +190,256 @@ def _compressed_result(result: FitResult) -> dict:
     }
 
 
-async def run_agent_cli(
-    store: LocalStore,
-    model: Model,
-    executor: FitExecutor | None,
-    *,
-    stdin: TextIO,
-    stdout: TextIO,
-) -> None:
-    """Run an interactive CLI while keeping every authority action outside the model."""
+@dataclass
+class _AgentCliSession:
+    """Own one interactive session while authority remains in explicit handlers."""
+
+    store: LocalStore
+    model: Model
+    executor: FitExecutor | None
+    stdout: TextIO
     selected: dict | None = None
     downsampled_preview: dict | None = None
     latest_result_summary: dict | None = None
-    for raw_line in stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
+
+    async def run(self, stdin: TextIO) -> None:
+        for raw_line in stdin:
+            line = raw_line.strip()
+            if line and not await self._handle_line(line):
+                return
+
+    async def _handle_line(self, line: str) -> bool:
         if line == "/quit":
-            return
+            return False
         if line.startswith("select "):
-            snapshot_id = line.removeprefix("select ").strip()
-            selected = None
-            downsampled_preview = None
-            latest_result_summary = None
-            try:
-                selected = inspect_dataset(store, snapshot_id)
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-            else:
-                print(
-                    "Selected Dataset Snapshot "
-                    f"{selected['dataset_snapshot_id']} "
-                    f"(content_hash={selected['content_hash']}).",
-                    file=stdout,
-                )
-            continue
+            self._select_dataset(line.removeprefix("select ").strip())
+            return True
         if line == "/preview authorize":
-            if selected is None:
-                print(
-                    "Error [dataset_required]: Select a Dataset Snapshot first.",
-                    file=stdout,
-                )
-                continue
-            try:
-                downsampled_preview = _downsampled_preview(store, selected)
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-                continue
-            with store.connect() as connection:
-                store.audit(
-                    connection,
-                    "dataset_preview.authorized",
-                    selected["dataset_snapshot_id"],
-                    {
-                        "preview_row_count": downsampled_preview["preview_row_count"],
-                        "source_row_count": downsampled_preview["source_row_count"],
-                    },
-                )
-            print(
-                "Authorized a bounded downsampled preview "
-                f"({downsampled_preview['preview_row_count']} rows).",
-                file=stdout,
-            )
-            continue
-        if line.startswith("/approve"):
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = []
-            if len(parts) != 2 or parts[0] != "/approve":
-                print(
-                    "Error [invalid_command]: Usage: /approve FIT_SPECIFICATION_ID",
-                    file=stdout,
-                )
-                continue
-            try:
-                approved = approve_fit_specification(store, parts[1])
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-                continue
-            print(
-                f"Approved Fit Recipe {approved['approved_fit_recipe_id']} "
-                f"(version={approved['version']}, content_hash={approved['content_hash']}).",
-                file=stdout,
-            )
-            continue
-        if line.startswith("/accept"):
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = []
-            if len(parts) != 2 or parts[0] != "/accept":
-                print(
-                    "Error [invalid_command]: Usage: /accept FIT_RESULT_ID",
-                    file=stdout,
-                )
-                continue
-            try:
-                accepted = accept_fit_result(store, parts[1])
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-                continue
-            print(
-                f"Accepted Fit {accepted['accepted_fit_id']} "
-                f"for Fit Result {accepted['fit_result_id']} "
-                f"at {accepted['accepted_at']}.",
-                file=stdout,
-            )
-            continue
-        if line.startswith("/status") or line.startswith("/cancel"):
-            command = "/status" if line.startswith("/status") else "/cancel"
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = []
-            if len(parts) != 2 or parts[0] != command:
-                print(
-                    f"Error [invalid_command]: Usage: {command} WORKER_JOB_ID",
-                    file=stdout,
-                )
-                continue
-            if executor is None:
-                print(
-                    "Error [worker_unavailable]: Origin Worker is not configured.",
-                    file=stdout,
-                )
-                continue
-            try:
-                if command == "/status":
-                    job = await executor.transport.status(parts[1])
-                    event_type = "worker_job.status_observed"
-                else:
-                    job = await executor.transport.cancel(parts[1])
-                    event_type = "worker_job.cancellation_requested"
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-                continue
-            with store.connect() as connection:
-                store.audit(
-                    connection,
-                    event_type,
-                    job.worker_job_id,
-                    {"status": job.status, "error_code": job.error_code},
-                )
-            details = [f"status={job.status}"]
-            if job.bundle_sha256 is not None:
-                details.append(f"bundle_sha256={job.bundle_sha256}")
-            if job.error_code is not None:
-                details.append(f"error={job.error_code}")
-            print(
-                f"Fit Job {job.worker_job_id}: " + ", ".join(details) + ".",
-                file=stdout,
-            )
-            continue
-        if line.startswith("/run"):
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = []
-            if len(parts) != 2 or parts[0] != "/run":
-                print(
-                    "Error [invalid_command]: Usage: /run APPROVED_FIT_RECIPE_ID",
-                    file=stdout,
-                )
-                continue
-            if selected is None:
-                print(
-                    "Error [dataset_required]: Select a Dataset Snapshot first.",
-                    file=stdout,
-                )
-                continue
-            if executor is None:
-                print(
-                    "Error [worker_unavailable]: Origin Worker is not configured.",
-                    file=stdout,
-                )
-                continue
-            try:
-                outcome = await executor.execute_approved_fit(
-                    store,
-                    selected["dataset_snapshot_id"],
-                    parts[1],
-                )
-            except OriginFitError as error:
-                print(f"Error [{error.code}]: {error.message}", file=stdout)
-                continue
-            if isinstance(outcome, PendingFitJob):
-                print(
-                    f"Fit Job {outcome.worker_job_id} remains pending "
-                    f"(worker_status={outcome.worker_status}). {outcome.message}",
-                    file=stdout,
-                )
-            else:
-                latest_result_summary = _compressed_result(outcome.fit_result)
-                classification = outcome.fit_result.classification
-                warning = (
-                    " REVIEW REQUIRED: inspect all diagnostics before acceptance."
-                    if classification == "review_required"
-                    else ""
-                )
-                print(
-                    f"Fit Job {outcome.worker_job_id} succeeded; "
-                    f"Fit Result {outcome.fit_result.fit_result_id}; "
-                    f"Fit Archive {outcome.fit_archive_id}; "
-                    f"bundle_sha256={outcome.bundle_sha256}; "
-                    f"classification={classification}.{warning}",
-                    file=stdout,
-                )
-            continue
+            self._authorize_preview()
+            return True
+        command_handlers = (
+            ("/approve", self._approve),
+            ("/accept", self._accept),
+            ("/status", self._status),
+            ("/cancel", self._cancel),
+            ("/run", self._run_fit),
+        )
+        for command, handler in command_handlers:
+            if line.startswith(command):
+                await handler(line)
+                return True
         if line.startswith("/"):
-            print("Error [unknown_command]: Unknown interactive command.", file=stdout)
-            continue
-        if selected is None:
+            print(
+                "Error [unknown_command]: Unknown interactive command.",
+                file=self.stdout,
+            )
+            return True
+        await self._ask_agent(line)
+        return True
+
+    def _print_error(self, error: OriginFitError) -> None:
+        print(f"Error [{error.code}]: {error.message}", file=self.stdout)
+
+    def _single_argument(
+        self, line: str, command: str, argument_name: str
+    ) -> str | None:
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = []
+        if len(parts) != 2 or parts[0] != command:
+            print(
+                f"Error [invalid_command]: Usage: {command} {argument_name}",
+                file=self.stdout,
+            )
+            return None
+        return parts[1]
+
+    def _require_dataset(self) -> dict | None:
+        if self.selected is None:
             print(
                 "Error [dataset_required]: Select a Dataset Snapshot first.",
-                file=stdout,
+                file=self.stdout,
             )
-            continue
-        tool = _proposal_tool(store, selected["dataset_snapshot_id"])
-        result = await Agent(model, tools=[tool]).run(
+        return self.selected
+
+    def _require_executor(self) -> FitExecutor | None:
+        if self.executor is None:
+            print(
+                "Error [worker_unavailable]: Origin Worker is not configured.",
+                file=self.stdout,
+            )
+        return self.executor
+
+    def _select_dataset(self, snapshot_id: str) -> None:
+        self.selected = None
+        self.downsampled_preview = None
+        self.latest_result_summary = None
+        try:
+            self.selected = inspect_dataset(self.store, snapshot_id)
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        print(
+            "Selected Dataset Snapshot "
+            f"{self.selected['dataset_snapshot_id']} "
+            f"(content_hash={self.selected['content_hash']}).",
+            file=self.stdout,
+        )
+
+    def _authorize_preview(self) -> None:
+        selected = self._require_dataset()
+        if selected is None:
+            return
+        try:
+            self.downsampled_preview = _downsampled_preview(self.store, selected)
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        with self.store.connect() as connection:
+            self.store.audit(
+                connection,
+                "dataset_preview.authorized",
+                selected["dataset_snapshot_id"],
+                {
+                    "preview_row_count": self.downsampled_preview["preview_row_count"],
+                    "source_row_count": self.downsampled_preview["source_row_count"],
+                },
+            )
+        print(
+            "Authorized a bounded downsampled preview "
+            f"({self.downsampled_preview['preview_row_count']} rows).",
+            file=self.stdout,
+        )
+
+    async def _approve(self, line: str) -> None:
+        specification_id = self._single_argument(
+            line, "/approve", "FIT_SPECIFICATION_ID"
+        )
+        if specification_id is None:
+            return
+        try:
+            approved = approve_fit_specification(self.store, specification_id)
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        print(
+            f"Approved Fit Recipe {approved['approved_fit_recipe_id']} "
+            f"(version={approved['version']}, content_hash={approved['content_hash']}).",
+            file=self.stdout,
+        )
+
+    async def _accept(self, line: str) -> None:
+        fit_result_id = self._single_argument(line, "/accept", "FIT_RESULT_ID")
+        if fit_result_id is None:
+            return
+        try:
+            accepted = accept_fit_result(self.store, fit_result_id)
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        print(
+            f"Accepted Fit {accepted['accepted_fit_id']} "
+            f"for Fit Result {accepted['fit_result_id']} "
+            f"at {accepted['accepted_at']}.",
+            file=self.stdout,
+        )
+
+    async def _status(self, line: str) -> None:
+        await self._control_worker(line, "/status")
+
+    async def _cancel(self, line: str) -> None:
+        await self._control_worker(line, "/cancel")
+
+    async def _control_worker(self, line: str, command: str) -> None:
+        worker_job_id = self._single_argument(line, command, "WORKER_JOB_ID")
+        if worker_job_id is None:
+            return
+        executor = self._require_executor()
+        if executor is None:
+            return
+        try:
+            if command == "/status":
+                job = await executor.transport.status(worker_job_id)
+                event_type = "worker_job.status_observed"
+            else:
+                job = await executor.transport.cancel(worker_job_id)
+                event_type = "worker_job.cancellation_requested"
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        with self.store.connect() as connection:
+            self.store.audit(
+                connection,
+                event_type,
+                job.worker_job_id,
+                {"status": job.status, "error_code": job.error_code},
+            )
+        details = [f"status={job.status}"]
+        if job.bundle_sha256 is not None:
+            details.append(f"bundle_sha256={job.bundle_sha256}")
+        if job.error_code is not None:
+            details.append(f"error={job.error_code}")
+        print(
+            f"Fit Job {job.worker_job_id}: " + ", ".join(details) + ".",
+            file=self.stdout,
+        )
+
+    async def _run_fit(self, line: str) -> None:
+        recipe_id = self._single_argument(
+            line, "/run", "APPROVED_FIT_RECIPE_ID"
+        )
+        if recipe_id is None:
+            return
+        selected = self._require_dataset()
+        if selected is None:
+            return
+        executor = self._require_executor()
+        if executor is None:
+            return
+        try:
+            outcome = await executor.execute_approved_fit(
+                self.store,
+                selected["dataset_snapshot_id"],
+                recipe_id,
+            )
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        if isinstance(outcome, PendingFitJob):
+            print(
+                f"Fit Job {outcome.worker_job_id} remains pending "
+                f"(worker_status={outcome.worker_status}). {outcome.message}",
+                file=self.stdout,
+            )
+            return
+        self.latest_result_summary = _compressed_result(outcome.fit_result)
+        classification = outcome.fit_result.classification
+        warning = (
+            " REVIEW REQUIRED: inspect all diagnostics before acceptance."
+            if classification == "review_required"
+            else ""
+        )
+        print(
+            f"Fit Job {outcome.worker_job_id} succeeded; "
+            f"Fit Result {outcome.fit_result.fit_result_id}; "
+            f"Fit Archive {outcome.fit_archive_id}; "
+            f"bundle_sha256={outcome.bundle_sha256}; "
+            f"classification={classification}.{warning}",
+            file=self.stdout,
+        )
+
+    async def _ask_agent(self, line: str) -> None:
+        selected = self._require_dataset()
+        if selected is None:
+            return
+        tool = _proposal_tool(self.store, selected["dataset_snapshot_id"])
+        result = await Agent(self.model, tools=[tool]).run(
             _agent_prompt(
                 line,
                 selected,
-                downsampled_preview,
-                latest_result_summary,
+                self.downsampled_preview,
+                self.latest_result_summary,
             )
         )
         rejected_tools = [
@@ -416,8 +451,8 @@ async def run_agent_cli(
             and part.tool_name != "propose_expdec2_fit"
         ]
         if rejected_tools:
-            with store.connect() as connection:
-                store.audit(
+            with self.store.connect() as connection:
+                self.store.audit(
                     connection,
                     "model.authority_action.rejected",
                     selected["dataset_snapshot_id"],
@@ -425,10 +460,22 @@ async def run_agent_cli(
                 )
             print(
                 "Rejected model-requested authority action; use an explicit CLI command.",
-                file=stdout,
+                file=self.stdout,
             )
         else:
-            print(result.output, file=stdout)
+            print(result.output, file=self.stdout)
+
+
+async def run_agent_cli(
+    store: LocalStore,
+    model: Model,
+    executor: FitExecutor | None,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> None:
+    """Run an interactive CLI while keeping every authority action outside the model."""
+    await _AgentCliSession(store, model, executor, stdout).run(stdin)
 
 
 __all__ = ("FitExecutor", "run_agent_cli")

@@ -141,10 +141,32 @@ class OriginSeriesResponse:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class OriginFittedCurve:
+    """Full-precision fitted curve values authored by Origin."""
+
+    series_name: str
+    x: tuple[float, ...]
+    y: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OriginGraphArtifacts:
+    """Origin-authored graph and project files for one completed execution."""
+
+    graph_profile: str
+    png: bytes
+    pdf: bytes
+    opju: bytes
+    fitted_curves: tuple[OriginFittedCurve, ...] = ()
+
+
 class OriginAdapter(Protocol):
     async def execute(
         self, request: OriginExecutionRequest
     ) -> tuple[OriginSeriesResponse, ...]: ...
+
+    def take_artifacts(self) -> OriginGraphArtifacts | None: ...
 
 
 class FakeOriginAdapter:
@@ -162,6 +184,9 @@ class FakeOriginAdapter:
     ) -> tuple[OriginSeriesResponse, ...]:
         self.requests.append(request)
         return self._responses
+
+    def take_artifacts(self) -> OriginGraphArtifacts | None:
+        return None
 
 
 class DeterministicFakeOriginAdapter:
@@ -213,6 +238,9 @@ class DeterministicFakeOriginAdapter:
                 )
             )
         return tuple(responses)
+
+    def take_artifacts(self) -> OriginGraphArtifacts | None:
+        return None
 
 
 def load_approved_fit_execution_request(

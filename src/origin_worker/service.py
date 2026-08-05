@@ -610,10 +610,7 @@ class OriginWorker:
             )
             adapter_name = getattr(self.adapter, "adapter_name", type(self.adapter).__name__)
             originpro_version = getattr(self.adapter, "originpro_version", "fake-2025")
-            graph_artifacts = None
-            take_artifacts = getattr(self.adapter, "take_artifacts", None)
-            if callable(take_artifacts):
-                graph_artifacts = take_artifacts()
+            graph_artifacts = self.adapter.take_artifacts()
             bundle, _ = build_result_bundle(
                 worker_job_id=worker_job_id,
                 request=request,

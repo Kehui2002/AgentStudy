@@ -33,6 +33,7 @@ Origin Worker 只能绑定 Windows 主机与 Linux 虚拟机共享的 host-only 
      --state-dir C:\ProgramData\OriginWorker `
      --host 192.168.56.1 `
      --host-only-network 192.168.56.0/24 `
+     --linux-guest-address 192.168.56.2 `
      --port 8443 `
      --certfile C:\ProgramData\OriginWorker\tls\worker.crt `
      --keyfile C:\ProgramData\OriginWorker\tls\worker.key
@@ -42,7 +43,14 @@ Origin Worker 只能绑定 Windows 主机与 Linux 虚拟机共享的 host-only 
    `--origin-visible`；`--fake-origin` 仅用于开发与回归测试，不能用于生产服务，且不能和
    `--origin-visible` 同时使用。
 
-`serve` 会在开始接收请求前验证 host-only 绑定、证书和私钥文件、至少 32 字符的 Token、本地工作目录、SQLite 可读写性与 Adapter 配置。任何预检失败都会让进程退出。
+`--host-only-network` 是部署者对虚拟网络边界的明确声明；Worker 不会尝试从
+Windows 网卡名称或类型自动推断 host-only 网络。`--linux-guest-address` 必须是该子网内、
+不同于 Worker 绑定地址的私有单播地址，并且必须与上面防火墙规则的
+`-RemoteAddress` 完全一致。除 Windows 防火墙限制外，Worker 还会在每个 `/v1`
+请求进入鉴权和业务处理前，只允许这个来源地址；无法取得客户端地址时也会拒绝请求。
+
+`serve` 会在开始接收请求前验证 host-only 绑定与 Linux guest 地址、证书和私钥文件、
+至少 32 字符的 Token、本地工作目录、SQLite 可读写性与 Adapter 配置。任何预检失败都会让进程退出。
 
 ## Linux 端证书固定
 

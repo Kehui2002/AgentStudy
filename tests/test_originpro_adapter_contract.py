@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import io
 import tempfile
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -11,6 +13,7 @@ import zipfile
 from origin_fit.execution import (
     DeterministicFakeOriginAdapter,
     OriginExecutionRequest,
+    OriginFittedCurve,
     OriginSeriesInput,
 )
 from origin_fit.remote import InProcessWorkerTransport, RemoteOriginExecutor
@@ -44,6 +47,9 @@ class _FakeWorksheet:
         del comments
         self.columns.append((column, values, lname, units, axis))
 
+    def to_list(self, column: int) -> list[object]:
+        return next(values for index, values, *_ in self.columns if index == column)
+
 
 class _FakePlot:
     def __init__(self, plot_type: str) -> None:
@@ -61,6 +67,7 @@ class _FakeAxis:
 class _FakeLayer:
     def __init__(self) -> None:
         self.plots: list[tuple[int, int, str, _FakePlot]] = []
+        self.plot_worksheets: list[_FakeWorksheet] = []
         self.axes = {"x": _FakeAxis(), "y": _FakeAxis()}
         self.legend_text = ""
 
@@ -71,7 +78,7 @@ class _FakeLayer:
         colx: int,
         type: str,
     ) -> _FakePlot:
-        del worksheet
+        self.plot_worksheets.append(worksheet)
         plot = _FakePlot(type)
         self.plots.append((coly, colx, type, plot))
         return plot
@@ -145,8 +152,12 @@ class _FakeNLFit:
         if prefix == "e":
             return 0.1
         if prefix == "l":
+            if self.module.omit_confidence_intervals:
+                raise KeyError(property_name)
             return self.parameters[parameter] - 0.2
         if prefix == "u":
+            if self.module.omit_confidence_intervals:
+                raise KeyError(property_name)
             return self.parameters[parameter] + 0.2
         raise KeyError(property_name)
 
@@ -154,19 +165,36 @@ class _FakeNLFit:
         return self._tree_name
 
     def fit(self) -> None:
+        if self.module.block_first_fit and not self.module.blocked_once:
+            self.module.blocked_once = True
+            self.module.fit_started.set()
+            self.module.fit_release.wait(timeout=0.3)
         if self.y_column == self.module.failed_y_column:
             raise RuntimeError("sensitive Origin detail")
 
     def report(self, autoupdate: bool = False) -> tuple[str, str]:
         del autoupdate
-        return "[Report]Fit!", "[Curves]Fit!"
+        index = len(self.module.report_calls) + 1
+        report_range = f"[Report{index}]Fit!"
+        curves_range = f"[Curves{index}]Fit!"
+        curves = _FakeWorksheet()
+        curve_x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        curves.from_list(0, curve_x, lname="X", axis="X")
+        curves.from_list(
+            1,
+            [900.0 + index - row for row, _ in enumerate(curve_x)],
+            lname="Fit Curve",
+            axis="Y",
+        )
+        self.module.report_calls.append((report_range, curves_range))
+        self.module.report_sheets[report_range] = _FakeWorksheet()
+        self.module.report_sheets[curves_range] = curves
+        return report_range, curves_range
 
     def result(self) -> dict[str, float]:
         values = {
             **self.parameters,
             **{f"e_{name}": 0.1 for name in PARAMETERS},
-            **{f"l_{name}": value - 0.2 for name, value in self.parameters.items()},
-            **{f"u_{name}": value + 0.2 for name, value in self.parameters.items()},
             "chisqr": 1.25,
             "dof": 7.0,
             "pts": 12.0,
@@ -177,6 +205,13 @@ class _FakeNLFit:
             "niter": 8.0,
             "fitstatus": 100.0,
         }
+        if not self.module.omit_confidence_intervals:
+            values.update(
+                {f"l_{name}": value - 0.2 for name, value in self.parameters.items()}
+            )
+            values.update(
+                {f"u_{name}": value + 0.2 for name, value in self.parameters.items()}
+            )
         return values
 
 
@@ -194,6 +229,15 @@ class _FakeOriginPro:
         self.saved_projects: list[str] = []
         self.failed_y_column: int | None = None
         self.tree_values: list[tuple[str, float]] = []
+        self.report_calls: list[tuple[str, str]] = []
+        self.report_sheets: dict[str, _FakeWorksheet] = {}
+        self.find_sheet_calls: list[tuple[str, str]] = []
+        self.block_first_fit = False
+        self.blocked_once = False
+        self.fit_started = threading.Event()
+        self.fit_release = threading.Event()
+        self.omit_confidence_intervals = False
+        self.omit_covariance = False
 
     def new(self, asksave: bool = False) -> None:
         self.new_calls.append(asksave)
@@ -206,6 +250,7 @@ class _FakeOriginPro:
 
     def exit(self) -> None:
         self.exit_calls += 1
+        self.fit_release.set()
 
     def org_ver(self) -> float:
         return 10.2
@@ -224,10 +269,16 @@ class _FakeOriginPro:
         return True
 
     def lt_float(self, expression: str) -> float:
+        if self.omit_covariance and ".covar1" in expression:
+            raise RuntimeError("covariance unavailable")
         row, column = expression.rsplit("[", 1)[1].removesuffix("]").split(",")
         if ".corr1" in expression:
             return 1.0 if row == column else 0.05
         return 1.0 if row == column else 0.0
+
+    def find_sheet(self, type: str, range: str) -> _FakeWorksheet:
+        self.find_sheet_calls.append((type, range))
+        return self.report_sheets[range]
 
     def new_graph(self, **kwargs: object) -> _FakeGraph:
         del kwargs
@@ -366,6 +417,23 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(responses[1].error_code, "origin_fit_failed")
         self.assertNotIn("sensitive", responses[1].error_message or "")
 
+    async def test_missing_origin_uncertainty_outputs_preserve_successful_fit(
+        self,
+    ) -> None:
+        from origin_worker.originpro_adapter import OriginProAdapter
+
+        originpro = _FakeOriginPro()
+        originpro.omit_confidence_intervals = True
+        originpro.omit_covariance = True
+        adapter = OriginProAdapter(originpro_module=originpro)
+
+        responses = await adapter.execute(_request())
+
+        self.assertEqual([item.status for item in responses], ["succeeded"] * 2)
+        self.assertEqual(responses[0].confidence_intervals, {})
+        self.assertIsNone(responses[0].covariance)
+        self.assertEqual(responses[0].covariance_status, "unavailable")
+
     async def test_builds_versioned_combined_graph_and_real_origin_artifacts(
         self,
     ) -> None:
@@ -389,6 +457,34 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(layer.axes["x"].title, "X (ns)")
         self.assertEqual(layer.axes["y"].title, "Y (counts)")
         self.assertEqual(layer.legend_text, "legend -c")
+
+    async def test_graph_uses_the_fitted_curves_authored_by_origin(self) -> None:
+        from origin_worker.originpro_adapter import OriginProAdapter
+
+        originpro = _FakeOriginPro()
+        adapter = OriginProAdapter(originpro_module=originpro)
+
+        await adapter.execute(_request())
+        artifacts = adapter.take_artifacts()
+
+        self.assertEqual(
+            originpro.find_sheet_calls,
+            [("w", "[Curves1]Fit!"), ("w", "[Curves2]Fit!")],
+        )
+        layer = originpro.graphs[0].layer
+        self.assertIs(
+            layer.plot_worksheets[1], originpro.report_sheets["[Curves1]Fit!"]
+        )
+        self.assertIs(
+            layer.plot_worksheets[3], originpro.report_sheets["[Curves2]Fit!"]
+        )
+        self.assertEqual(len(originpro.worksheets[0].columns), 5)
+        assert artifacts is not None
+        self.assertEqual(artifacts.fitted_curves[0].x, _request().series[0].x)
+        self.assertEqual(
+            artifacts.fitted_curves[0].y,
+            (901.0, 900.0, 899.0, 898.0, 897.0, 896.0),
+        )
 
     async def test_terminate_closes_only_the_owned_origin_instance(self) -> None:
         from origin_worker.originpro_adapter import OriginProAdapter
@@ -418,6 +514,26 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(originpro.new_calls, [False, False])
         self.assertEqual(originpro.exit_calls, 1)
 
+    async def test_timeout_can_interrupt_blocking_origin_and_next_job_is_clean(
+        self,
+    ) -> None:
+        from origin_worker.originpro_adapter import OriginProAdapter
+
+        originpro = _FakeOriginPro()
+        originpro.block_first_fit = True
+        adapter = OriginProAdapter(originpro_module=originpro)
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.execute(_request()), timeout=0.03)
+        adapter.terminate()
+
+        responses = await asyncio.wait_for(adapter.execute(_request()), timeout=0.5)
+
+        self.assertTrue(originpro.fit_started.is_set())
+        self.assertEqual([item.status for item in responses], ["succeeded"] * 2)
+        self.assertEqual(originpro.new_calls, [False, False])
+        self.assertEqual(originpro.exit_calls, 1)
+
     def test_importing_adapter_does_not_import_originpro_on_linux(self) -> None:
         sys.modules.pop("originpro", None)
 
@@ -438,11 +554,20 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
 
             def take_artifacts(self) -> OriginGraphArtifacts:
                 self.take_count += 1
+                request = self.requests[-1]
                 return OriginGraphArtifacts(
                     graph_profile="expdec2-standard@1.0",
                     png=b"PRODUCTION-PNG",
                     pdf=b"PRODUCTION-PDF",
                     opju=b"PRODUCTION-OPJU",
+                    fitted_curves=tuple(
+                        OriginFittedCurve(
+                            series_name=series.series_name,
+                            x=series.x,
+                            y=tuple(1234.0 + index for index, _ in enumerate(series.x)),
+                        )
+                        for series in request.series
+                    ),
                 )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -463,6 +588,7 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(archive.read("combined.png"), b"PRODUCTION-PNG")
                 self.assertEqual(archive.read("combined.pdf"), b"PRODUCTION-PDF")
                 self.assertEqual(archive.read("project.opju"), b"PRODUCTION-OPJU")
+                self.assertIn(b",1234.0\n", archive.read("fitted-data.csv"))
             self.assertEqual(adapter.take_count, 1)
 
     def test_worker_cli_selects_visible_production_adapter_by_default(self) -> None:
@@ -498,6 +624,8 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
                         "192.168.56.1",
                         "--host-only-network",
                         "192.168.56.0/24",
+                        "--linux-guest-address",
+                        "192.168.56.2",
                         "--certfile",
                         str(certificate),
                         "--keyfile",

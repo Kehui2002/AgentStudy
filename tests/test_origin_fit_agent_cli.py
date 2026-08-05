@@ -441,7 +441,16 @@ class OriginFitAgentCliTests(unittest.IsolatedAsyncioTestCase):
                         status="succeeded",
                         valid_point_count=12,
                         converged=False,
-                        fit_statistics={"r_squared": 0.98},
+                        fit_statistics={
+                            "origin_reduced_chi_square": 1.25,
+                            "degrees_of_freedom": 7.0,
+                            "residual_sum_of_squares": 0.125,
+                            "adjusted_r_squared": 0.97,
+                            "r_squared": 0.98,
+                            "root_mean_square_error": 0.05,
+                            "iteration_count": 9.0,
+                            "point_count": 12.0,
+                        },
                         warnings=["origin_not_converged"],
                     )
                 ],
@@ -497,6 +506,17 @@ class OriginFitAgentCliTests(unittest.IsolatedAsyncioTestCase):
             prompt = first_prompt(model)
             self.assertIn('"classification":"review_required"', prompt)
             self.assertIn('"warnings":["origin_not_converged"]', prompt)
+            for statistic_name in (
+                "origin_reduced_chi_square",
+                "degrees_of_freedom",
+                "residual_sum_of_squares",
+                "adjusted_r_squared",
+                "r_squared",
+                "root_mean_square_error",
+                "iteration_count",
+            ):
+                self.assertIn(f'"{statistic_name}"', prompt)
+            self.assertNotIn('"point_count"', prompt)
             self.assertNotIn("residuals", prompt)
             accepted = inspect_persisted_object(store, "audit")
             assert accepted is not None

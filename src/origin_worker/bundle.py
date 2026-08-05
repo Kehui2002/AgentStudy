@@ -5,7 +5,7 @@ import hashlib
 import io
 import json
 import math
-from typing import TYPE_CHECKING, Any
+from typing import Any
 import zipfile
 
 from origin_fit.contracts import (
@@ -21,12 +21,13 @@ from origin_fit.contracts import (
     ManifestSpecification,
     WorkerSubmission,
 )
-from origin_fit.execution import FitResult, OriginExecutionRequest
+from origin_fit.execution import (
+    FitResult,
+    OriginExecutionRequest,
+    OriginFittedCurve,
+    OriginGraphArtifacts,
+)
 from origin_fit.storage import utc_now
-
-if TYPE_CHECKING:
-    from .originpro_adapter import OriginGraphArtifacts
-
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(
@@ -51,9 +52,36 @@ def _fit_value(x: float, parameters: dict[str, float]) -> float:
 
 
 def _data_artifacts(
-    request: OriginExecutionRequest, result: FitResult
+    request: OriginExecutionRequest,
+    result: FitResult,
+    fitted_curves: tuple[OriginFittedCurve, ...] = (),
+    *,
+    require_origin_curves: bool = False,
 ) -> tuple[bytes, bytes]:
     outcomes = {item.series_name: item for item in result.series_outcomes}
+    if len({curve.series_name for curve in fitted_curves}) != len(fitted_curves):
+        raise ValueError("Origin returned duplicate fitted curves for a series.")
+    origin_values = {
+        curve.series_name: dict(zip(curve.x, curve.y)) for curve in fitted_curves
+    }
+    if require_origin_curves:
+        succeeded = {
+            item.series_name
+            for item in result.series_outcomes
+            if item.status == "succeeded"
+        }
+        if set(origin_values) != succeeded:
+            raise ValueError(
+                "Origin fitted curves must match every successful series exactly."
+            )
+        for series in request.series:
+            if series.series_name not in succeeded:
+                continue
+            missing_x = set(series.x).difference(origin_values[series.series_name])
+            if missing_x:
+                raise ValueError(
+                    "Origin fitted curves must cover every fitted observation."
+                )
     fitted_rows: list[list[object]] = []
     residual_rows: list[list[object]] = []
     for series in request.series:
@@ -61,7 +89,10 @@ def _data_artifacts(
         parameters = outcome.parameters
         canonical = parameters.model_dump() if parameters is not None else None
         for x, observed in zip(series.x, series.y):
-            fitted = _fit_value(x, canonical) if canonical is not None else ""
+            if series.series_name in origin_values:
+                fitted: float | str = origin_values[series.series_name].get(x, "")
+            else:
+                fitted = _fit_value(x, canonical) if canonical is not None else ""
             residual = observed - fitted if isinstance(fitted, float) else ""
             fitted_rows.append([series.series_name, x, observed, fitted])
             residual_rows.append([series.series_name, x, residual])
@@ -100,11 +131,16 @@ def build_result_bundle(
 ) -> tuple[bytes, FitResultManifest]:
     approved_fit_recipe = submission.approved_fit_recipe
     specification = approved_fit_recipe["fit_specification"]
-    fitted_data, residuals = _data_artifacts(request, result)
     if adapter_name.startswith("originpro-2025-adapter/") and graph_artifacts is None:
         raise ValueError(
             "The Production Origin Adapter did not provide graph artifacts."
         )
+    fitted_data, residuals = _data_artifacts(
+        request,
+        result,
+        graph_artifacts.fitted_curves if graph_artifacts is not None else (),
+        require_origin_curves=adapter_name.startswith("originpro-2025-adapter/"),
+    )
     if graph_artifacts is None:
         png, pdf, opju = _fake_graph_artifacts(result)
     else:

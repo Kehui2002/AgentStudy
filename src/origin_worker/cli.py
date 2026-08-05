@@ -21,6 +21,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--host", required=True)
     serve.add_argument("--host-only-network", required=True)
+    serve.add_argument("--linux-guest-address", required=True)
     serve.add_argument("--port", type=int, default=8443)
     serve.add_argument("--certfile", required=True, type=Path)
     serve.add_argument("--keyfile", required=True, type=Path)
@@ -36,6 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         host_only_network = ipaddress.ip_network(
             arguments.host_only_network, strict=False
         )
+        linux_guest = ipaddress.ip_address(arguments.linux_guest_address)
     except ValueError as error:
         raise SystemExit("Origin Worker host-only address/network is invalid.") from error
     if (
@@ -49,6 +51,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise SystemExit(
             "Origin Worker host must belong to the declared private host-only network."
+        )
+    if (
+        linux_guest not in host_only_network
+        or linux_guest == host
+        or not linux_guest.is_private
+        or linux_guest.is_unspecified
+        or linux_guest.is_loopback
+        or linux_guest.is_link_local
+        or linux_guest.is_multicast
+        or linux_guest == host_only_network.network_address
+        or linux_guest == host_only_network.broadcast_address
+    ):
+        raise SystemExit(
+            "Linux guest address must be a distinct private unicast address in the "
+            "declared host-only network."
         )
     if not arguments.certfile.is_file() or not arguments.keyfile.is_file():
         raise SystemExit("Origin Worker TLS certificate and key must exist.")
@@ -91,7 +108,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import uvicorn
 
-    app = create_app(worker, bearer_token=token)
+    app = create_app(
+        worker,
+        bearer_token=token,
+        allowed_client_hosts={str(linux_guest)},
+    )
     try:
         uvicorn.run(
             app,

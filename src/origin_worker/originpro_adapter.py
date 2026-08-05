@@ -7,17 +7,21 @@ so importing :mod:`origin_worker` remains safe on Linux.  Tests inject a small
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib
-import math
 from pathlib import Path
 import sys
 import tempfile
+import threading
 from types import ModuleType
 from typing import Any, Literal, cast
 
 from origin_fit.execution import (
     OriginExecutionRequest,
+    OriginFittedCurve,
+    OriginGraphArtifacts,
     OriginSeriesInput,
     OriginSeriesResponse,
 )
@@ -42,21 +46,20 @@ class OriginProAdapterError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class OriginGraphArtifacts:
-    """Origin-authored graph and project files for one completed execution."""
-
-    graph_profile: str
-    png: bytes
-    pdf: bytes
-    opju: bytes
-
-
-@dataclass(frozen=True, slots=True)
 class _ColumnLayout:
     x: int
     y_by_series: dict[str, int]
     error_by_series: dict[str, int]
     next_column: int
+
+
+@dataclass(frozen=True, slots=True)
+class _OriginFittedCurve:
+    worksheet: Any
+    x: tuple[float, ...]
+    y: tuple[float, ...]
+    x_column: int = 0
+    y_column: int = 1
 
 
 class OriginProAdapter:
@@ -91,6 +94,12 @@ class OriginProAdapter:
         self._visible = visible
         self._owns_instance = False
         self._artifacts: OriginGraphArtifacts | None = None
+        self._origin_lock = threading.Lock()
+        self._instance_state_lock = threading.Lock()
+        self._discard_instance = threading.Event()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="originpro-adapter"
+        )
 
     async def execute(
         self, request: OriginExecutionRequest
@@ -98,6 +107,29 @@ class OriginProAdapter:
         """Run every Y independently and preserve an ordered partial outcome."""
 
         self._validate_request(request)
+        future = self._executor.submit(self._execute_serialized, request)
+        while not future.done():
+            await asyncio.sleep(0.01)
+        return future.result()
+
+    def _execute_serialized(
+        self, request: OriginExecutionRequest
+    ) -> tuple[OriginSeriesResponse, ...]:
+        with self._origin_lock:
+            if self._discard_instance.is_set():
+                self._close_owned_instance()
+                self._discard_instance.clear()
+            try:
+                return self._execute_sync(request)
+            finally:
+                if self._discard_instance.is_set():
+                    self._artifacts = None
+                    self._close_owned_instance()
+                    self._discard_instance.clear()
+
+    def _execute_sync(
+        self, request: OriginExecutionRequest
+    ) -> tuple[OriginSeriesResponse, ...]:
         if self._owns_instance:
             self._op.new(asksave=False)
         else:
@@ -105,10 +137,10 @@ class OriginProAdapter:
         self._artifacts = None
         worksheet, columns = self._write_input_worksheet(request)
         outcomes: list[OriginSeriesResponse] = []
-        fitted_parameters: dict[str, dict[str, float]] = {}
+        fitted_curves: dict[str, _OriginFittedCurve] = {}
         for series in request.series:
             try:
-                response = self._fit_series(
+                response, fitted_curve = self._fit_series(
                     request, series, worksheet, columns
                 )
             except Exception:
@@ -119,10 +151,10 @@ class OriginProAdapter:
                 )
             outcomes.append(response)
             if response.status == "succeeded":
-                fitted_parameters[series.series_name] = response.raw_parameters
+                fitted_curves[series.series_name] = fitted_curve
 
         self._artifacts = self._render_artifacts(
-            request, worksheet, columns, fitted_parameters
+            request, worksheet, columns, fitted_curves
         )
         return tuple(outcomes)
 
@@ -136,33 +168,61 @@ class OriginProAdapter:
     def preflight(self) -> None:
         """Start and validate the dedicated automation server before serving."""
 
-        self._start_owned_instance()
+        self._executor.submit(self._preflight_serialized).result()
+
+    def _preflight_serialized(self) -> None:
+        with self._origin_lock:
+            self._start_owned_instance()
 
     def terminate(self) -> None:
         """Close the automation server owned by this adapter, if started."""
 
-        if not self._owns_instance:
+        self._discard_instance.set()
+        if self._origin_lock.acquire(blocking=False):
+            try:
+                self._artifacts = None
+                self._close_owned_instance()
+                self._discard_instance.clear()
+            finally:
+                self._origin_lock.release()
             return
-        self._owns_instance = False
-        self._op.exit()
+        # A timed-out Origin call is still running in its worker thread.
+        # Interrupt the owned automation server without blocking the asyncio
+        # loop; the serialized execution wrapper cleans its state before the
+        # next job may enter Origin.
+        threading.Thread(
+            target=self._close_owned_instance,
+            name="originpro-force-terminate",
+            daemon=True,
+        ).start()
 
     close = terminate
 
     def _start_owned_instance(self) -> None:
-        if self._owns_instance:
-            return
-        # originpro's default external-Python Application starts a new server;
-        # attach() is deliberately never used here.
-        self._op.new(asksave=False)
-        self._owns_instance = True
-        self._op.set_show(self._visible)
-        version = float(self._op.org_ver())
+        with self._instance_state_lock:
+            if self._owns_instance:
+                return
+            # originpro's default external-Python Application starts a new server;
+            # attach() is deliberately never used here.
+            self._op.new(asksave=False)
+            self._owns_instance = True
+            self._op.set_show(self._visible)
+            version = float(self._op.org_ver())
         if not 10.2 <= version < 10.3:
             self.terminate()
             raise OriginProAdapterError(
                 "OriginPro 2025 (version 10.2 or 10.25) is required."
             )
         self.originpro_version = f"OriginPro {version:g}"
+
+    def _close_owned_instance(self) -> None:
+        with self._instance_state_lock:
+            if not self._owns_instance:
+                return
+            try:
+                self._op.exit()
+            finally:
+                self._owns_instance = False
 
     @staticmethod
     def _validate_request(request: OriginExecutionRequest) -> None:
@@ -247,7 +307,7 @@ class OriginProAdapter:
         series: OriginSeriesInput,
         worksheet: Any,
         columns: _ColumnLayout,
-    ) -> OriginSeriesResponse:
+    ) -> tuple[OriginSeriesResponse, _OriginFittedCurve]:
         model = self._op.NLFit("ExpDec2")
         yerr: int | str = columns.error_by_series.get(series.series_name, "")
         model.set_data(
@@ -284,7 +344,17 @@ class OriginProAdapter:
             "nlgui __PY_ORIGIN_FIT_OUTPUT 0;"
         )
         model.fit()
-        model.report(autoupdate=False)
+        report_ranges = model.report(autoupdate=False)
+        if not (
+            isinstance(report_ranges, tuple)
+            and len(report_ranges) == 2
+            and all(isinstance(item, str) for item in report_ranges)
+        ):
+            raise OriginProAdapterError("OriginPro returned invalid NLFit report ranges.")
+        _, curves_range = report_ranges
+        curves_worksheet = self._op.find_sheet("w", curves_range)
+        if curves_worksheet is None:
+            raise OriginProAdapterError("OriginPro omitted the fitted curves worksheet.")
         raw_result = model.result()
         if not isinstance(raw_result, dict):
             raise OriginProAdapterError("OriginPro returned an invalid NLFit result.")
@@ -298,21 +368,20 @@ class OriginProAdapter:
             name: self._result_number(raw_result, f"e_{name}", model)
             for name in _RAW_PARAMETER_ORDER
         }
-        intervals = {
-            name: (
-                self._result_number(raw_result, f"l_{name}", model),
-                self._result_number(raw_result, f"u_{name}", model),
-            )
-            for name in _RAW_PARAMETER_ORDER
-        }
-        covariance = self._origin_matrix(tree_name, "covar1")
-        correlation = self._origin_matrix(tree_name, "corr1")
+        intervals: dict[str, tuple[float, float]] = {}
+        for name in _RAW_PARAMETER_ORDER:
+            lower = self._optional_result_number(raw_result, f"l_{name}", model)
+            upper = self._optional_result_number(raw_result, f"u_{name}", model)
+            if lower is not None and upper is not None:
+                intervals[name] = (lower, upper)
+        covariance = self._optional_origin_matrix(tree_name, "covar1")
+        correlation = self._optional_origin_matrix(tree_name, "corr1")
         correlations = {
             f"{row_name}:{column_name}": correlation[row][column]
             for row, row_name in enumerate(_RAW_PARAMETER_ORDER)
             for column, column_name in enumerate(_RAW_PARAMETER_ORDER)
             if row < column
-        }
+        } if correlation is not None else {}
         status = raw_result.get("fitstatus")
         status_text = str(status).strip().lower()
         converged = status == 100 or (
@@ -320,9 +389,9 @@ class OriginProAdapter:
             and "not" not in status_text
         )
         covariance_status: Literal["available", "unavailable", "singular"] = (
-            "available"
+            "available" if covariance is not None else "unavailable"
         )
-        if "singular" in status_text:
+        if covariance is not None and "singular" in status_text:
             covariance_status = "singular"
         statistics_names = {
             "chisqr": "origin_reduced_chi_square",
@@ -344,19 +413,42 @@ class OriginProAdapter:
             for name in _POSITIVE_PARAMETERS
             if parameters[name] <= max(1e-12, abs(parameters[name]) * 1e-9)
         )
-        return OriginSeriesResponse(
-            series_name=series.series_name,
-            converged=converged,
-            raw_parameters=parameters,
-            standard_errors=errors,
-            confidence_intervals=intervals,
-            covariance=covariance,
-            correlations=correlations,
-            fit_statistics=statistics,
-            actual_initial_values=initial_values,
-            boundary_parameters=near_boundary,
-            covariance_status=covariance_status,
+        return (
+            OriginSeriesResponse(
+                series_name=series.series_name,
+                converged=converged,
+                raw_parameters=parameters,
+                standard_errors=errors,
+                confidence_intervals=intervals,
+                covariance=covariance,
+                correlations=correlations,
+                fit_statistics=statistics,
+                actual_initial_values=initial_values,
+                boundary_parameters=near_boundary,
+                covariance_status=covariance_status,
+            ),
+            self._read_fitted_curve(curves_worksheet),
         )
+
+    @staticmethod
+    def _read_fitted_curve(worksheet: Any) -> _OriginFittedCurve:
+        x_values = worksheet.to_list(0)
+        y_values = worksheet.to_list(1)
+        if not (
+            isinstance(x_values, list)
+            and isinstance(y_values, list)
+            and len(x_values) == len(y_values)
+            and x_values
+        ):
+            raise OriginProAdapterError("OriginPro returned an invalid fitted curve.")
+        try:
+            x = tuple(float(value) for value in x_values)
+            y = tuple(float(value) for value in y_values)
+        except (TypeError, ValueError) as error:
+            raise OriginProAdapterError(
+                "OriginPro returned non-numeric fitted curve values."
+            ) from error
+        return _OriginFittedCurve(worksheet=worksheet, x=x, y=y)
 
     @staticmethod
     def _explicit_initial_values(
@@ -394,6 +486,20 @@ class OriginProAdapter:
             raise OriginProAdapterError(f"OriginPro omitted NLFit quantity '{name}'.")
         return float(cast(int | float, value))
 
+    @staticmethod
+    def _optional_result_number(
+        raw_result: dict[str, Any], name: str, model: Any
+    ) -> float | None:
+        value = raw_result.get(name)
+        if not _is_number(value):
+            try:
+                value = model._get(name)
+            except Exception:
+                return None
+        if not _is_number(value):
+            return None
+        return float(cast(int | float, value))
+
     def _origin_matrix(self, tree_name: str, matrix_name: str) -> list[list[float]]:
         return [
             [
@@ -403,12 +509,20 @@ class OriginProAdapter:
             for row in range(1, 6)
         ]
 
+    def _optional_origin_matrix(
+        self, tree_name: str, matrix_name: str
+    ) -> list[list[float]] | None:
+        try:
+            return self._origin_matrix(tree_name, matrix_name)
+        except Exception:
+            return None
+
     def _render_artifacts(
         self,
         request: OriginExecutionRequest,
         worksheet: Any,
         columns: _ColumnLayout,
-        fitted_parameters: dict[str, dict[str, float]],
+        fitted_curves: dict[str, _OriginFittedCurve],
     ) -> OriginGraphArtifacts:
         graph = self._op.new_graph(
             lname="ExpDec2 Combined Fit", template="Origin", hidden=not self._visible
@@ -418,15 +532,6 @@ class OriginProAdapter:
                 "OriginPro could not create the combined graph."
             )
         layer = graph[0]
-        fitted_column = columns.next_column
-        shared_x = sorted(
-            {
-                x
-                for series in request.series
-                for x in series.x
-                if request.fit_minimum <= x <= request.fit_maximum
-            }
-        )
         for index, series in enumerate(request.series):
             color = _COLORS[index % len(_COLORS)]
             observed = layer.add_plot(
@@ -438,21 +543,13 @@ class OriginProAdapter:
             observed.color = color
             observed.symbol_kind = 3
             observed.symbol_size = 5
-            parameters = fitted_parameters.get(series.series_name)
-            if parameters is None:
+            curve = fitted_curves.get(series.series_name)
+            if curve is None:
                 continue
-            fit_y = [_expdec2(x, parameters) for x in shared_x]
-            worksheet.from_list(
-                fitted_column,
-                fit_y,
-                lname=f"{series.series_name} — ExpDec2 fit",
-                axis="Y",
-            )
             fitted = layer.add_plot(
-                worksheet, fitted_column, columns.x, type="l"
+                curve.worksheet, curve.y_column, curve.x_column, type="l"
             )
             fitted.color = color
-            fitted_column += 1
         layer.axis("x").title = _axis_title("X", request.x_unit)
         layer.axis("y").title = _y_axis_title(request)
         layer.rescale()
@@ -477,6 +574,15 @@ class OriginProAdapter:
                     png=png_path.read_bytes(),
                     pdf=pdf_path.read_bytes(),
                     opju=opju_path.read_bytes(),
+                    fitted_curves=tuple(
+                        OriginFittedCurve(
+                            series_name=series.series_name,
+                            x=fitted_curves[series.series_name].x,
+                            y=fitted_curves[series.series_name].y,
+                        )
+                        for series in request.series
+                        if series.series_name in fitted_curves
+                    ),
                 )
             except OSError as error:
                 raise OriginProAdapterError(
@@ -486,16 +592,6 @@ class OriginProAdapter:
 
 def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _expdec2(x: float, parameters: dict[str, float]) -> float:
-    """Evaluate, but never optimize, Origin's authoritative fitted parameters."""
-
-    return (
-        parameters["y0"]
-        + parameters["A1"] * math.exp(-x / parameters["t1"])
-        + parameters["A2"] * math.exp(-x / parameters["t2"])
-    )
 
 
 def _axis_title(name: str, unit: str) -> str:

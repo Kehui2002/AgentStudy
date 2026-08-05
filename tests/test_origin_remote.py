@@ -557,7 +557,11 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 ),
             )
-            app = create_app(worker, bearer_token="test-secret-token")
+            app = create_app(
+                worker,
+                bearer_token="test-secret-token",
+                allowed_client_hosts={"127.0.0.1"},
+            )
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="https://origin-worker.test",
@@ -758,6 +762,8 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                     "8.8.8.8",
                     "--host-only-network",
                     "192.168.56.0/24",
+                    "--linux-guest-address",
+                    "192.168.56.2",
                     "--certfile",
                     "/tmp/missing.crt",
                     "--keyfile",

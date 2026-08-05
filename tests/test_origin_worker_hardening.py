@@ -73,6 +73,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
                 worker,
                 bearer_token="t" * 32,
                 max_upload_bytes=64,
+                allowed_client_hosts={"127.0.0.1"},
             )
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
@@ -91,6 +92,48 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 413)
             self.assertEqual(response.json()["detail"]["code"], "upload_too_large")
             self.assertEqual(tuple(worker.jobs_dir.iterdir()), ())
+
+    async def test_http_rejects_a_request_from_an_undeclared_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker = OriginWorker(
+                Path(temporary_directory) / "worker",
+                DeterministicFakeOriginAdapter(),
+            )
+            app = create_app(
+                worker,
+                bearer_token="t" * 32,
+                allowed_client_hosts={"192.168.56.2"},
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(
+                    app=app, client=("192.168.56.3", 49152)
+                ),
+                base_url="https://origin-worker.test",
+            ) as client:
+                response = await client.get("/v1/health")
+
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.json()["detail"]["code"], "client_not_allowed")
+
+    async def test_http_rejects_a_v1_request_without_a_client_address(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker = OriginWorker(
+                Path(temporary_directory) / "worker",
+                DeterministicFakeOriginAdapter(),
+            )
+            app = create_app(
+                worker,
+                bearer_token="t" * 32,
+                allowed_client_hosts={"192.168.56.2"},
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, client=None),
+                base_url="https://origin-worker.test",
+            ) as client:
+                response = await client.get("/v1/capabilities", headers=AUTHORIZATION)
+
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.json()["detail"]["code"], "client_not_allowed")
 
     def test_worker_rejects_a_workspace_root_symlinked_outside_its_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -195,6 +238,9 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_execution_is_terminated_before_the_next_job(self) -> None:
         class DirtyAfterCrashAdapter:
+            adapter_name = "custom-origin-adapter/1.0"
+            originpro_version = "fake-originpro-2025"
+
             def __init__(self) -> None:
                 self.execution_count = 0
                 self.terminated = 0
@@ -210,6 +256,9 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
 
             def terminate(self) -> None:
                 self.terminated += 1
+
+            def take_artifacts(self):  # type: ignore[no-untyped-def]
+                return self.delegate.take_artifacts()
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -255,6 +304,8 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
                             "192.168.56.1",
                             "--host-only-network",
                             "192.168.56.0/24",
+                            "--linux-guest-address",
+                            "192.168.56.2",
                             "--certfile",
                             str(certfile),
                             "--keyfile",
@@ -264,6 +315,56 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
                     )
 
             self.assertIn("state directory", str(raised.exception))
+
+    def test_serve_preflight_rejects_a_guest_outside_host_only_network(
+        self,
+    ) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            worker_main(
+                [
+                    "serve",
+                    "--state-dir",
+                    "/tmp/origin-worker-test-state",
+                    "--host",
+                    "192.168.56.1",
+                    "--host-only-network",
+                    "192.168.56.0/24",
+                    "--linux-guest-address",
+                    "192.168.57.2",
+                    "--certfile",
+                    "/tmp/missing.crt",
+                    "--keyfile",
+                    "/tmp/missing.key",
+                    "--fake-origin",
+                ]
+            )
+
+        self.assertIn("Linux guest", str(raised.exception))
+
+    def test_serve_preflight_requires_a_distinct_guest_unicast_address(self) -> None:
+        for guest_address in ("192.168.56.0", "192.168.56.1", "192.168.56.255"):
+            with self.subTest(guest_address=guest_address):
+                with self.assertRaises(SystemExit) as raised:
+                    worker_main(
+                        [
+                            "serve",
+                            "--state-dir",
+                            "/tmp/origin-worker-test-state",
+                            "--host",
+                            "192.168.56.1",
+                            "--host-only-network",
+                            "192.168.56.0/24",
+                            "--linux-guest-address",
+                            guest_address,
+                            "--certfile",
+                            "/tmp/missing.crt",
+                            "--keyfile",
+                            "/tmp/missing.key",
+                            "--fake-origin",
+                        ]
+                    )
+
+                self.assertIn("Linux guest", str(raised.exception))
 
 
 if __name__ == "__main__":

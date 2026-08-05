@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from contextlib import asynccontextmanager
 import hmac
 from typing import Any
@@ -18,6 +19,7 @@ def create_app(
     bearer_token: str,
     cleanup_interval: float = 60 * 60,
     max_upload_bytes: int | None = None,
+    allowed_client_hosts: Collection[str] | None = None,
 ) -> Any:
     """Create the optional FastAPI `/v1` transport adapter."""
     if not bearer_token:
@@ -37,7 +39,10 @@ def create_app(
             Request,
             status,
         )
-        from fastapi.responses import Response  # type: ignore[import-not-found]
+        from fastapi.responses import (  # type: ignore[import-not-found]
+            JSONResponse,
+            Response,
+        )
     except ImportError as error:  # pragma: no cover - depends on installation extra
         raise RuntimeError(
             "Install the 'origin-worker' extra to serve the Worker API."
@@ -75,6 +80,28 @@ def create_app(
 
     app = FastAPI(title="Origin Worker", version="1.0", lifespan=lifespan)
     app.state.queue_tasks = set()
+    allowed_hosts = (
+        None if allowed_client_hosts is None else frozenset(allowed_client_hosts)
+    )
+
+    @app.middleware("http")
+    async def restrict_client(request: Request, call_next: Any) -> Any:
+        is_v1_request = request.url.path == "/v1" or request.url.path.startswith(
+            "/v1/"
+        )
+        if is_v1_request and allowed_hosts is not None:
+            client_host = request.client.host if request.client is not None else None
+            if client_host not in allowed_hosts:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={
+                        "detail": {
+                            "code": "client_not_allowed",
+                            "message": "Client source is not allowed.",
+                        }
+                    },
+                )
+        return await call_next(request)
 
     async def authenticate(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {bearer_token}"
