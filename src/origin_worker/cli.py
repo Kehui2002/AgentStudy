@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from pathlib import Path
 from typing import Sequence
@@ -17,6 +18,7 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve")
     serve.add_argument("--state-dir", required=True, type=Path)
     serve.add_argument("--host", required=True)
+    serve.add_argument("--host-only-network", required=True)
     serve.add_argument("--port", type=int, default=8443)
     serve.add_argument("--certfile", required=True, type=Path)
     serve.add_argument("--keyfile", required=True, type=Path)
@@ -26,8 +28,25 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    if arguments.host in {"0.0.0.0", "::"}:
-        raise SystemExit("Origin Worker must bind to a specific host-only address.")
+    try:
+        host = ipaddress.ip_address(arguments.host)
+        host_only_network = ipaddress.ip_network(
+            arguments.host_only_network, strict=False
+        )
+    except ValueError as error:
+        raise SystemExit("Origin Worker host-only address/network is invalid.") from error
+    if (
+        host not in host_only_network
+        or not host.is_private
+        or not host_only_network.is_private
+        or host.is_unspecified
+        or host.is_loopback
+        or host.is_link_local
+        or host.is_multicast
+    ):
+        raise SystemExit(
+            "Origin Worker host must belong to the declared private host-only network."
+        )
     if not arguments.certfile.is_file() or not arguments.keyfile.is_file():
         raise SystemExit("Origin Worker TLS certificate and key must exist.")
     token = os.environ.get("ORIGIN_WORKER_TOKEN", "")

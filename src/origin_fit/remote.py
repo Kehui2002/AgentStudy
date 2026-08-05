@@ -228,6 +228,7 @@ class RemoteOriginExecutor:
         )
         capabilities = await self.transport.capabilities()
         self._negotiate(capabilities, submission)
+        self._audit_negotiation(store, capabilities, submission)
         idempotency_key = "sha256:" + hashlib.sha256(
             f"{dataset_snapshot_id}\0{approved_fit_recipe_id}".encode("utf-8")
         ).hexdigest()
@@ -366,6 +367,28 @@ class RemoteOriginExecutor:
                 "worker_job.status_observed",
                 job.worker_job_id,
                 {"status": job.status, "error_code": job.error_code},
+            )
+
+    @staticmethod
+    def _audit_negotiation(
+        store: LocalStore,
+        capabilities: WorkerCapabilities,
+        submission: WorkerSubmission,
+    ) -> None:
+        specification = submission.approved_fit_recipe["fit_specification"]
+        with store.connect() as connection:
+            store.audit(
+                connection,
+                "worker.capabilities.negotiated",
+                submission.approved_fit_recipe_id,
+                {
+                    "transport_schema_version": capabilities.transport_schema_version,
+                    "fit_specification_schema_version": specification["schema_version"],
+                    "fit_result_schema_version": FIT_RESULT_SCHEMA_VERSION,
+                    "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+                    "model": specification["model"]["name"],
+                    "graph_profile": specification["graph_profile"],
+                },
             )
 
     @staticmethod

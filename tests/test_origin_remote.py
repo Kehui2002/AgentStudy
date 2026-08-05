@@ -13,6 +13,7 @@ import httpx
 
 from origin_fit.datasets import ImportSelection, import_dataset
 from origin_fit.execution import (
+    DeterministicFakeOriginAdapter,
     FakeOriginAdapter,
     OriginExecutionRequest,
     OriginSeriesResponse,
@@ -33,7 +34,9 @@ from origin_fit.specifications import (
 )
 from origin_fit.storage import LocalStore
 from origin_worker.service import OriginWorker
+from origin_worker.service import WorkerError
 from origin_worker.api import create_app
+from origin_worker.cli import main as origin_worker_main
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -195,6 +198,12 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertIn("fit_result_bundle.hash_verified", event_types)
             self.assertIn("fit_archive.created", event_types)
+            self.assertIn("worker.capabilities.negotiated", event_types)
+            worker_events = [
+                event["event_type"] for event in worker.inspect_audit_events()
+            ]
+            self.assertIn("worker.capabilities.reported", worker_events)
+            self.assertIn("fit_job.status_queried", worker_events)
 
     async def test_reuses_the_same_worker_job_for_an_idempotent_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -358,6 +367,41 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             await restarted_again.run_queued()
             self.assertEqual(adapter.requests, [])
+
+    async def test_api_startup_resumes_a_queued_job_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = LocalStore(root / "linux")
+            snapshot_id, recipe_id = approved_fixture(store)
+            adapter = FakeOriginAdapter(
+                [
+                    successful_response(
+                        "decay_a", y0=1.0, a1=7.0, t1=1.5, a2=4.0, t2=8.0
+                    ),
+                    successful_response(
+                        "decay_b", y0=0.8, a1=5.0, t1=1.0, a2=3.2, t2=6.0
+                    ),
+                    successful_response(
+                        "decay_c", y0=1.5, a1=9.0, t1=0.8, a2=4.5, t2=5.0
+                    ),
+                ]
+            )
+            worker_state = root / "worker"
+            first_process = OriginWorker(worker_state, adapter)
+            executor = RemoteOriginExecutor(InProcessWorkerTransport(first_process))
+            submission = executor.prepare_submission(store, snapshot_id, recipe_id)
+            submitted = first_process.submit(submission, "startup-resume-test")
+
+            restarted = OriginWorker(worker_state, adapter)
+            app = create_app(restarted, bearer_token="test-secret-token")
+            async with app.router.lifespan_context(app):
+                for _ in range(100):
+                    status = restarted.get_job(submitted.worker_job_id)
+                    if status.status == "succeeded":
+                        break
+                    await asyncio.sleep(0.01)
+
+            self.assertEqual(status.status, "succeeded")
 
     async def test_rejects_incompatible_transport_major_before_submission(self) -> None:
         class IncompatibleTransport:
@@ -639,6 +683,59 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(raised.exception.code, "worker_execution_error")
             self.assertNotIn(secret, raised.exception.message)
             self.assertNotIn(secret.encode(), worker.database_path.read_bytes())
+
+    async def test_expired_terminal_workspace_is_removed_but_metadata_remains(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = LocalStore(root / "linux")
+            snapshot_id, recipe_id = approved_fixture(store)
+            worker = OriginWorker(
+                root / "worker",
+                DeterministicFakeOriginAdapter(),
+                workspace_retention_days=0,
+            )
+            executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
+            outcome = await executor.execute_approved_fit(
+                store,
+                snapshot_id,
+                recipe_id,
+                wait_timeout=2,
+                poll_interval=0.01,
+            )
+            assert isinstance(outcome, ArchivedFitResult)
+
+            removed = worker.cleanup_expired_workspaces()
+
+            self.assertEqual(removed, [outcome.worker_job_id])
+            self.assertEqual(worker.get_job(outcome.worker_job_id).status, "succeeded")
+            with self.assertRaises(WorkerError) as raised:
+                worker.get_bundle(outcome.worker_job_id)
+            self.assertEqual(raised.exception.code, "bundle_unavailable")
+
+    def test_worker_cli_rejects_an_address_outside_declared_host_only_network(
+        self,
+    ) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            origin_worker_main(
+                [
+                    "serve",
+                    "--state-dir",
+                    "/tmp/origin-worker-test-state",
+                    "--host",
+                    "8.8.8.8",
+                    "--host-only-network",
+                    "192.168.56.0/24",
+                    "--certfile",
+                    "/tmp/missing.crt",
+                    "--keyfile",
+                    "/tmp/missing.key",
+                    "--fake-origin",
+                ]
+            )
+
+        self.assertIn("host-only", str(raised.exception))
 
 
 if __name__ == "__main__":

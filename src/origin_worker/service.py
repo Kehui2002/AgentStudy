@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Iterator
 import uuid
@@ -49,7 +51,10 @@ class OriginWorker:
         max_rows: int = 1_000_000,
         max_y_series: int = 20,
         job_timeout: float = 30 * 60,
+        workspace_retention_days: int = 7,
     ) -> None:
+        if workspace_retention_days < 0:
+            raise ValueError("workspace_retention_days must not be negative")
         self.state_dir = state_dir
         self.database_path = state_dir / "worker.sqlite3"
         self.jobs_dir = state_dir / "jobs"
@@ -58,6 +63,7 @@ class OriginWorker:
         self.max_rows = max_rows
         self.max_y_series = max_y_series
         self.job_timeout = job_timeout
+        self.workspace_retention_days = workspace_retention_days
         self._queue_lock = asyncio.Lock()
         state_dir.mkdir(parents=True, exist_ok=True)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +82,8 @@ class OriginWorker:
                     error_code TEXT,
                     error_message TEXT,
                     workspace_ref TEXT NOT NULL,
-                    bundle_sha256 TEXT
+                    bundle_sha256 TEXT,
+                    workspace_purged_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS state_transitions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +102,14 @@ class OriginWorker:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(fit_jobs)").fetchall()
+            }
+            if "workspace_purged_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE fit_jobs ADD COLUMN workspace_purged_at TEXT"
+                )
             interrupted = connection.execute(
                 "SELECT id FROM fit_jobs WHERE status = 'running'"
             ).fetchall()
@@ -131,7 +146,7 @@ class OriginWorker:
             connection.close()
 
     def capabilities(self) -> WorkerCapabilities:
-        return WorkerCapabilities(
+        capabilities = WorkerCapabilities(
             transport_schema_version="1.0",
             fit_specification_schema_versions=["1.0"],
             fit_result_schema_versions=["1.0"],
@@ -144,6 +159,18 @@ class OriginWorker:
             max_rows=self.max_rows,
             max_y_series=self.max_y_series,
         )
+        with self.connect() as connection:
+            self._audit(
+                connection,
+                "worker.capabilities.reported",
+                "worker",
+                {
+                    "transport_schema_version": capabilities.transport_schema_version,
+                    "fit_result_schema_versions": capabilities.fit_result_schema_versions,
+                    "manifest_schema_versions": capabilities.manifest_schema_versions,
+                },
+            )
+        return capabilities
 
     def health(self) -> dict[str, str]:
         with self.connect() as connection:
@@ -227,9 +254,72 @@ class OriginWorker:
             row = connection.execute(
                 "SELECT * FROM fit_jobs WHERE id = ?", (worker_job_id,)
             ).fetchone()
+            if row is not None:
+                self._audit(
+                    connection,
+                    "fit_job.status_queried",
+                    worker_job_id,
+                    {"status": row["status"]},
+                )
         if row is None:
             raise WorkerError("not_found", f"Fit Job '{worker_job_id}' not found.")
         return self._job(row)
+
+    def inspect_audit_events(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_type, occurred_at, object_id, details_json
+                FROM audit_events ORDER BY id
+                """
+            ).fetchall()
+        return [
+            {
+                "event_type": row["event_type"],
+                "occurred_at": row["occurred_at"],
+                "object_id": row["object_id"],
+                "details": json.loads(row["details_json"]),
+            }
+            for row in rows
+        ]
+
+    def cleanup_expired_workspaces(
+        self, *, now: datetime | None = None
+    ) -> list[str]:
+        current_time = now or datetime.now(timezone.utc)
+        cutoff = current_time - timedelta(days=self.workspace_retention_days)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, finished_at, workspace_ref FROM fit_jobs
+                WHERE status IN ('succeeded', 'failed', 'cancelled')
+                  AND finished_at IS NOT NULL
+                  AND workspace_purged_at IS NULL
+                ORDER BY finished_at, id
+                """
+            ).fetchall()
+        removed: list[str] = []
+        for row in rows:
+            finished_at = datetime.fromisoformat(row["finished_at"])
+            if finished_at > cutoff:
+                continue
+            workspace = self._workspace(row["workspace_ref"])
+            if workspace.exists():
+                shutil.rmtree(workspace)
+            purged_at = current_time.isoformat()
+            with self.connect() as connection:
+                connection.execute(
+                    "UPDATE fit_jobs SET workspace_purged_at = ? WHERE id = ?",
+                    (purged_at, row["id"]),
+                )
+                self._audit(
+                    connection,
+                    "fit_job.workspace_purged",
+                    row["id"],
+                    {"retention_days": self.workspace_retention_days},
+                )
+            removed.append(str(row["id"]))
+        return removed
 
     def cancel(self, worker_job_id: str) -> WorkerJob:
         with self.connect() as connection:
@@ -464,11 +554,7 @@ class OriginWorker:
                 worker_job_id=worker_job_id,
                 request=request,
                 result=result,
-                dataset_snapshot_id=submission.dataset_snapshot_id,
-                dataset_content_hash=submission.dataset_content_hash,
-                approved_fit_recipe_id=submission.approved_fit_recipe_id,
-                approved_fit_recipe_hash=submission.approved_fit_recipe_hash,
-                approved_fit_recipe=submission.approved_fit_recipe,
+                submission=submission,
                 adapter_name=str(adapter_name),
                 originpro_version=str(originpro_version),
             )

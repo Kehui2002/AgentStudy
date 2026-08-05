@@ -19,6 +19,7 @@ from origin_fit.contracts import (
     ManifestSchemas,
     ManifestSoftware,
     ManifestSpecification,
+    WorkerSubmission,
 )
 from origin_fit.execution import FitResult, OriginExecutionRequest
 from origin_fit.storage import utc_now
@@ -89,14 +90,11 @@ def build_result_bundle(
     worker_job_id: str,
     request: OriginExecutionRequest,
     result: FitResult,
-    dataset_snapshot_id: str,
-    dataset_content_hash: str,
-    approved_fit_recipe_id: str,
-    approved_fit_recipe_hash: str,
-    approved_fit_recipe: dict[str, Any],
+    submission: WorkerSubmission,
     adapter_name: str,
     originpro_version: str,
 ) -> tuple[bytes, FitResultManifest]:
+    approved_fit_recipe = submission.approved_fit_recipe
     specification = approved_fit_recipe["fit_specification"]
     fitted_data, residuals = _data_artifacts(request, result)
     png, pdf, opju = _fake_graph_artifacts(result)
@@ -122,11 +120,12 @@ def build_result_bundle(
         status="succeeded",
         created_at=utc_now(),
         dataset_snapshot=ManifestObject(
-            id=dataset_snapshot_id, sha256=dataset_content_hash
+            id=submission.dataset_snapshot_id,
+            sha256=submission.dataset_content_hash,
         ),
         approved_fit_recipe=ManifestRecipe(
-            id=approved_fit_recipe_id,
-            sha256=approved_fit_recipe_hash,
+            id=submission.approved_fit_recipe_id,
+            sha256=submission.approved_fit_recipe_hash,
             version=approved_fit_recipe["version"],
         ),
         fit_specification=ManifestSpecification(

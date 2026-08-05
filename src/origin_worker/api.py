@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 from typing import Any
 
@@ -27,7 +28,27 @@ def create_app(worker: OriginWorker, *, bearer_token: str) -> Any:
             "Install the 'origin-worker' extra to serve the Worker API."
         ) from error
 
-    app = FastAPI(title="Origin Worker", version="1.0")
+    @asynccontextmanager
+    async def lifespan(app: Any):  # type: ignore[no-untyped-def]
+        worker.cleanup_expired_workspaces()
+        startup_task = asyncio.create_task(worker.run_queued())
+        app.state.queue_tasks.add(startup_task)
+        startup_task.add_done_callback(task_finished)
+        try:
+            yield
+        finally:
+            tasks = tuple(app.state.queue_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    def task_finished(task: asyncio.Task[None]) -> None:
+        app.state.queue_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    app = FastAPI(title="Origin Worker", version="1.0", lifespan=lifespan)
     app.state.queue_tasks = set()
 
     async def authenticate(authorization: str | None = Header(default=None)) -> None:
@@ -71,7 +92,7 @@ def create_app(worker: OriginWorker, *, bearer_token: str) -> Any:
             raise worker_error(error) from error
         task = asyncio.create_task(worker.run_queued())
         app.state.queue_tasks.add(task)
-        task.add_done_callback(app.state.queue_tasks.discard)
+        task.add_done_callback(task_finished)
         return job.model_dump(mode="json")
 
     @app.get("/v1/jobs/{worker_job_id}")

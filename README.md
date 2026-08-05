@@ -153,6 +153,7 @@ export ORIGIN_WORKER_TOKEN='至少 32 个字符的部署秘密'
 origin-worker serve \
   --state-dir .origin-worker \
   --host 192.168.56.1 \
+  --host-only-network 192.168.56.0/24 \
   --port 8443 \
   --certfile /受控路径/origin-worker.crt \
   --keyfile /受控路径/origin-worker.key \
