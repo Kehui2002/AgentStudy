@@ -141,3 +141,41 @@ origin-fit --state-dir .origin-fit inspect '<approved-fit-recipe-id>'
 
 `propose` 的 Fit Specification 始终没有执行权限。只有独立的 `approve` CLI
 操作会创建 Approved Fit Recipe；任意语义变化都会产生新的规格哈希并要求重新批准。
+
+## 远程 Origin Worker 与 Fit Archive
+
+安装 Worker 可选依赖后，可以前台方式启动仅用于开发和 Linux 回归测试的
+Fake Origin Worker：
+
+```bash
+python3 -m pip install -e '.[origin-worker]'
+export ORIGIN_WORKER_TOKEN='至少 32 个字符的部署秘密'
+origin-worker serve \
+  --state-dir .origin-worker \
+  --host 192.168.56.1 \
+  --host-only-network 192.168.56.0/24 \
+  --port 8443 \
+  --certfile /受控路径/origin-worker.crt \
+  --keyfile /受控路径/origin-worker.key \
+  --fake-origin
+```
+
+Worker 拒绝 `0.0.0.0`/`::` 通配监听，并要求 HTTPS 证书与 Bearer Token；部署时还应
+用 Windows 防火墙把监听地址限制到 Linux 虚拟机。Linux 客户端通过
+`HttpWorkerTransport.with_pinned_certificate(...)` 固定校验自签名证书，随后由
+`RemoteOriginExecutor.execute_approved_fit(...)` 隐藏 capability 协商、幂等提交、
+状态轮询、Bundle 下载、manifest/文件哈希校验和 Fit Archive 持久化。
+
+`/v1` 提供 `health`、`capabilities`、幂等任务提交、状态、取消和 Bundle 下载接口。
+Worker SQLite 保存队列和状态元数据，Dataset Snapshot 与 Bundle 保存在逐任务隔离
+工作区；Linux SQLite 保存 Worker Job 映射和归档索引，内容寻址对象存储长期保存
+Snapshot 与验证后的 Bundle。可用现有命令查看本地索引：
+
+```bash
+origin-fit --state-dir .origin-fit inspect '<fit-job-id>'
+origin-fit --state-dir .origin-fit inspect '<fit-archive-id>'
+```
+
+`--fake-origin` 只生成确定性的测试结果和占位 PNG/PDF/OPJU 产物，不代表真实
+OriginPro 自动化已经验证；真实 OriginPro 覆盖仍必须在显式启用的 Windows 验收环境
+中完成。
