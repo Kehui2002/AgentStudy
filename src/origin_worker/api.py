@@ -10,10 +10,17 @@ from origin_fit.contracts import WorkerSubmission
 from .service import OriginWorker, WorkerError
 
 
-def create_app(worker: OriginWorker, *, bearer_token: str) -> Any:
+def create_app(
+    worker: OriginWorker,
+    *,
+    bearer_token: str,
+    cleanup_interval: float = 60 * 60,
+) -> Any:
     """Create the optional FastAPI `/v1` transport adapter."""
     if not bearer_token:
         raise ValueError("Worker Bearer Token must not be empty")
+    if cleanup_interval <= 0:
+        raise ValueError("cleanup_interval must be positive")
     try:
         from fastapi import (  # type: ignore[import-not-found]
             Depends,
@@ -34,6 +41,9 @@ def create_app(worker: OriginWorker, *, bearer_token: str) -> Any:
         startup_task = asyncio.create_task(worker.run_queued())
         app.state.queue_tasks.add(startup_task)
         startup_task.add_done_callback(task_finished)
+        cleanup_task = asyncio.create_task(cleanup_forever())
+        app.state.queue_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(task_finished)
         try:
             yield
         finally:
@@ -42,6 +52,11 @@ def create_app(worker: OriginWorker, *, bearer_token: str) -> Any:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def cleanup_forever() -> None:
+        while True:
+            await asyncio.sleep(cleanup_interval)
+            worker.cleanup_expired_workspaces()
 
     def task_finished(task: asyncio.Task[None]) -> None:
         app.state.queue_tasks.discard(task)

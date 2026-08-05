@@ -714,6 +714,37 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 worker.get_bundle(outcome.worker_job_id)
             self.assertEqual(raised.exception.code, "bundle_unavailable")
 
+    async def test_api_periodically_cleans_expired_terminal_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = LocalStore(root / "linux")
+            snapshot_id, recipe_id = approved_fixture(store)
+            worker = OriginWorker(
+                root / "worker",
+                DeterministicFakeOriginAdapter(),
+                workspace_retention_days=0,
+            )
+            executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
+            submission = executor.prepare_submission(store, snapshot_id, recipe_id)
+            app = create_app(
+                worker,
+                bearer_token="test-secret-token",
+                cleanup_interval=0.01,
+            )
+
+            async with app.router.lifespan_context(app):
+                submitted = worker.submit(submission, "periodic-cleanup-test")
+                await worker.run_queued()
+                for _ in range(100):
+                    try:
+                        worker.get_bundle(submitted.worker_job_id)
+                    except WorkerError as error:
+                        self.assertEqual(error.code, "bundle_unavailable")
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("expired workspace was not cleaned periodically")
+
     def test_worker_cli_rejects_an_address_outside_declared_host_only_network(
         self,
     ) -> None:
