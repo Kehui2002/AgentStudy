@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 import math
+from pathlib import Path
+import re
 from typing import Literal, Protocol
 import uuid
 
@@ -23,6 +25,8 @@ class _StrictModel(BaseModel):
 
 
 JsonNumber = float | Literal["NaN", "Infinity", "-Infinity"]
+_TEMPLATE_ID_PATTERN = re.compile(r"^template:[a-z0-9][a-z0-9-]{0,63}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class FitRange(_StrictModel):
@@ -113,6 +117,17 @@ class OriginExecutionRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class OriginGraphTemplate:
+    """An immutable, user-selected Origin graph template for rendering only."""
+
+    template_id: str
+    version: int
+    sha256: str
+    graph_profile: str
+    path: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class OriginSeriesResponse:
     series_name: str
     status: Literal["succeeded", "failed"] = "succeeded"
@@ -163,7 +178,9 @@ class OriginGraphArtifacts:
 
 class OriginAdapter(Protocol):
     async def execute(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None = None,
     ) -> tuple[OriginSeriesResponse, ...]: ...
 
     def take_artifacts(self) -> OriginGraphArtifacts | None: ...
@@ -180,8 +197,11 @@ class FakeOriginAdapter:
         self.requests: list[OriginExecutionRequest] = []
 
     async def execute(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None = None,
     ) -> tuple[OriginSeriesResponse, ...]:
+        del graph_template
         self.requests.append(request)
         return self._responses
 
@@ -199,8 +219,11 @@ class DeterministicFakeOriginAdapter:
         self.requests: list[OriginExecutionRequest] = []
 
     async def execute(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None = None,
     ) -> tuple[OriginSeriesResponse, ...]:
+        del graph_template
         self.requests.append(request)
         responses: list[OriginSeriesResponse] = []
         span = request.fit_maximum - request.fit_minimum
@@ -306,6 +329,7 @@ def load_approved_fit_execution_request(
         for name in y_names
     ]
     weighting_mode = specification.get("weighting", {}).get("mode")
+    template = specification.get("graph_template")
     if (
         model.get("name") != "ExpDec2"
         or model.get("x_offset_fitted") is not False
@@ -313,6 +337,14 @@ def load_approved_fit_execution_request(
         or y_series != expected_y_series
         or specification.get("units") != metadata["units"]
         or specification.get("constraints") != expected_constraints
+        or not (
+            isinstance(template, dict)
+            and _TEMPLATE_ID_PATTERN.fullmatch(str(template.get("template_id", "")))
+            and isinstance(template.get("version"), int)
+            and not isinstance(template.get("version"), bool)
+            and int(template["version"]) >= 1
+            and _SHA256_PATTERN.fullmatch(str(template.get("sha256", "")))
+        )
         or fit_range.get("inclusive") is not True
         or weighting_mode not in ("none", "instrument")
         or (
@@ -625,6 +657,7 @@ async def execute_approved_fit(
     adapter: OriginAdapter,
     *,
     fit_job_id: str | None = None,
+    graph_template: OriginGraphTemplate | None = None,
 ) -> FitResult:
     request, exclusions, valid_counts = load_approved_fit_execution_request(
         store, dataset_snapshot_id, approved_fit_recipe_id
@@ -654,7 +687,7 @@ async def execute_approved_fit(
                 "approved_fit_recipe_id": approved_fit_recipe_id,
             },
         )
-    responses = await adapter.execute(request)
+    responses = await adapter.execute(request, graph_template)
     if tuple(response.series_name for response in responses) != tuple(
         item.series_name for item in request.series
     ):

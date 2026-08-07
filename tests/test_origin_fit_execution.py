@@ -31,6 +31,7 @@ from origin_fit.specifications import (
     propose_fit_specification,
 )
 from origin_fit.storage import LocalStore
+from tests.test_support import TEMPLATE_ID, TEMPLATE_SHA256, TEMPLATE_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,9 @@ def approved_fixture(
         initialization=initialization,
         graph_profile_id="expdec2-standard",
         graph_profile_version="1.0",
+        template_id=TEMPLATE_ID,
+        template_version=TEMPLATE_VERSION,
+        template_sha256=TEMPLATE_SHA256,
         initial_values=(
             {
                 name: {

@@ -318,6 +318,24 @@ class RemoteOriginExecutor:
         supported_profiles = {
             (item.id, item.version) for item in capabilities.graph_profiles
         }
+        registered_templates = {
+            (
+                item.template_id,
+                item.version,
+                item.sha256,
+                item.graph_profile.id,
+                item.graph_profile.version,
+            )
+            for item in capabilities.graph_templates
+        }
+        template = specification.get("graph_template", {})
+        template_reference = (
+            template.get("template_id"),
+            template.get("version"),
+            template.get("sha256"),
+            profile["id"],
+            profile["version"],
+        )
         if (
             capabilities.transport_schema_version.split(".", 1)[0]
             != TRANSPORT_SCHEMA_VERSION.split(".", 1)[0]
@@ -327,6 +345,7 @@ class RemoteOriginExecutor:
             or MANIFEST_SCHEMA_VERSION not in capabilities.manifest_schema_versions
             or specification["model"]["name"] not in capabilities.models
             or (profile["id"], profile["version"]) not in supported_profiles
+            or template_reference not in registered_templates
         ):
             raise OriginFitError(
                 "incompatible_worker",
@@ -415,6 +434,7 @@ class RemoteOriginExecutor:
                     "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
                     "model": specification["model"]["name"],
                     "graph_profile": specification["graph_profile"],
+                    "graph_template": specification.get("graph_template"),
                 },
             )
 
@@ -482,6 +502,8 @@ class RemoteOriginExecutor:
             or manifest.schemas.fit_result != FIT_RESULT_SCHEMA_VERSION
             or manifest.schemas.manifest != MANIFEST_SCHEMA_VERSION
             or manifest.graph_profile.model_dump() != specification["graph_profile"]
+            or manifest.graph_template.model_dump()
+            != specification["graph_template"]
         ):
             raise OriginFitError(
                 "bundle_integrity_error", "Fit Result manifest provenance is inconsistent."

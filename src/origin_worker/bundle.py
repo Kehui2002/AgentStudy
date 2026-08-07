@@ -19,6 +19,7 @@ from origin_fit.contracts import (
     ManifestSchemas,
     ManifestSoftware,
     ManifestSpecification,
+    ManifestTemplate,
     WorkerSubmission,
 )
 from origin_fit.execution import (
@@ -191,6 +192,9 @@ def build_result_bundle(
             id=approved_fit_recipe["fit_specification_id"],
             sha256=approved_fit_recipe["fit_specification_hash"],
             schema_version=specification["schema_version"],
+        ),
+        graph_template=ManifestTemplate.model_validate(
+            specification["graph_template"], strict=True
         ),
         software=ManifestSoftware(
             worker="origin-worker/0.1.0",

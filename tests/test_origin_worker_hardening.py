@@ -18,6 +18,7 @@ from origin_fit.remote import InProcessWorkerTransport, RemoteOriginExecutor
 from origin_fit.storage import LocalStore
 from origin_worker.api import create_app
 from origin_worker.cli import main as worker_main
+from tests.test_support import make_worker
 from origin_worker.service import OriginWorker, WorkerError
 from tests.test_origin_remote import approved_fixture
 
@@ -65,7 +66,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            worker = OriginWorker(
+            worker = make_worker(
                 Path(temporary_directory) / "worker",
                 DeterministicFakeOriginAdapter(),
             )
@@ -95,7 +96,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_rejects_a_request_from_an_undeclared_guest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            worker = OriginWorker(
+            worker = make_worker(
                 Path(temporary_directory) / "worker",
                 DeterministicFakeOriginAdapter(),
             )
@@ -117,7 +118,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_rejects_a_v1_request_without_a_client_address(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            worker = OriginWorker(
+            worker = make_worker(
                 Path(temporary_directory) / "worker",
                 DeterministicFakeOriginAdapter(),
             )
@@ -154,7 +155,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(
+            worker = make_worker(
                 root / "worker",
                 DeterministicFakeOriginAdapter(),
                 max_rows=12,
@@ -177,7 +178,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            limited_worker = OriginWorker(
+            limited_worker = make_worker(
                 root / "worker",
                 DeterministicFakeOriginAdapter(),
                 max_dataset_bytes=1,
@@ -205,7 +206,8 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
                 self.active = 0
                 self.maximum_active = 0
 
-            async def execute(self, request):  # type: ignore[no-untyped-def]
+            async def execute(self, request, graph_template=None):  # type: ignore[no-untyped-def]
+                del graph_template
                 self.active += 1
                 self.maximum_active = max(self.maximum_active, self.active)
                 try:
@@ -219,7 +221,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
             adapter = MeasuringAdapter()
-            worker = OriginWorker(root / "worker", adapter)
+            worker = make_worker(root / "worker", adapter)
             submission = RemoteOriginExecutor(
                 InProcessWorkerTransport(worker)
             ).prepare_submission(store, snapshot_id, recipe_id)
@@ -246,13 +248,13 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
                 self.terminated = 0
                 self.delegate = DeterministicFakeOriginAdapter()
 
-            async def execute(self, request):  # type: ignore[no-untyped-def]
+            async def execute(self, request, graph_template=None):  # type: ignore[no-untyped-def]
                 self.execution_count += 1
                 if self.execution_count == 1:
                     raise RuntimeError("private Origin crash details")
                 if self.terminated != 1:
                     raise RuntimeError("dirty Origin instance was reused")
-                return await self.delegate.execute(request)
+                return await self.delegate.execute(request, graph_template)
 
             def terminate(self) -> None:
                 self.terminated += 1
@@ -265,7 +267,7 @@ class OriginWorkerHardeningTests(unittest.IsolatedAsyncioTestCase):
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
             adapter = DirtyAfterCrashAdapter()
-            worker = OriginWorker(root / "worker", adapter)
+            worker = make_worker(root / "worker", adapter)
             submission = RemoteOriginExecutor(
                 InProcessWorkerTransport(worker)
             ).prepare_submission(store, snapshot_id, recipe_id)

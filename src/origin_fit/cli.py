@@ -63,6 +63,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     propose_parser.add_argument("--initial-values", type=Path)
     propose_parser.add_argument("--graph-profile", required=True)
+    propose_parser.add_argument("--template", required=True)
+    propose_parser.add_argument("--template-sha256", required=True)
+
+    templates_parser = commands.add_parser("templates")
+    templates_parser.add_argument("--worker-url", required=True)
+    templates_parser.add_argument("--worker-certificate", required=True, type=Path)
 
     approve_parser = commands.add_parser("approve")
     approve_parser.add_argument("fit_specification_id")
@@ -89,6 +95,25 @@ def _graph_profile(value: str) -> tuple[str, str]:
     return profile_id, version
 
 
+def _template_reference(value: str) -> tuple[str, int]:
+    if "@" not in value:
+        raise OriginFitError(
+            "invalid_argument", "--template requires TEMPLATE_ID@VERSION."
+        )
+    template_id, raw_version = value.rsplit("@", 1)
+    try:
+        version = int(raw_version)
+    except ValueError as error:
+        raise OriginFitError(
+            "invalid_argument", "--template version must be an integer."
+        ) from error
+    if version < 1:
+        raise OriginFitError(
+            "invalid_argument", "--template version must be at least 1."
+        )
+    return template_id, version
+
+
 def _initial_values(path: Path | None) -> dict | None:
     if path is None:
         return None
@@ -103,6 +128,67 @@ def _initial_values(path: Path | None) -> dict | None:
             "invalid_fit_specification", "Initial values must be a JSON object."
         )
     return value
+
+
+async def _run_templates_command(
+    store: LocalStore,
+    arguments: argparse.Namespace,
+    *,
+    stdout: TextIO,
+) -> None:
+    worker_credential = os.environ.get("ORIGIN_WORKER_TOKEN")
+    if not worker_credential:
+        raise OriginFitError(
+            "missing_configuration", "Required credentials are not configured."
+        )
+    try:
+        transport = HttpWorkerTransport.with_pinned_certificate(
+            arguments.worker_url,
+            token=worker_credential,
+            pinned_certificate=arguments.worker_certificate,
+        )
+    except ValueError as error:
+        raise OriginFitError(
+            "invalid_worker_configuration", "Origin Worker configuration is invalid."
+        ) from error
+    try:
+        capabilities = await transport.capabilities()
+    finally:
+        await transport.aclose()
+    templates = [
+        template.model_dump(mode="json") for template in capabilities.graph_templates
+    ]
+    suggestion = templates[0] if templates else None
+    with store.connect() as connection:
+        store.audit(
+            connection,
+            "graph_template.suggested",
+            "worker",
+            {
+                "suggestion": (
+                    {
+                        "template_id": suggestion["template_id"],
+                        "version": suggestion["version"],
+                        "sha256": suggestion["sha256"],
+                    }
+                    if suggestion is not None
+                    else None
+                ),
+                "template_count": len(templates),
+            },
+        )
+    result: dict = {"graph_templates": templates}
+    if suggestion is not None:
+        result["suggestion"] = {
+            "template_id": suggestion["template_id"],
+            "version": suggestion["version"],
+            "sha256": suggestion["sha256"],
+            "message": (
+                "Suggestion only; you must explicitly select a template "
+                "with --template TEMPLATE_ID@VERSION --template-sha256 SHA256."
+            ),
+        }
+    print(json.dumps(result, sort_keys=True), file=stdout)
 
 
 async def _run_configured_agent(
@@ -168,6 +254,15 @@ def main(
                 )
             )
             return 0
+        if arguments.command == "templates":
+            asyncio.run(
+                _run_templates_command(
+                    store,
+                    arguments,
+                    stdout=output,
+                )
+            )
+            return 0
         if arguments.command == "import":
             result = import_dataset(
                 store,
@@ -188,6 +283,7 @@ def main(
             )
         elif arguments.command == "propose":
             profile_id, profile_version = _graph_profile(arguments.graph_profile)
+            template_id, template_version = _template_reference(arguments.template)
             result = propose_fit_specification(
                 store,
                 arguments.dataset_snapshot_id,
@@ -198,6 +294,9 @@ def main(
                 initialization=arguments.initialization,
                 graph_profile_id=profile_id,
                 graph_profile_version=profile_version,
+                template_id=template_id,
+                template_version=template_version,
+                template_sha256=arguments.template_sha256,
                 initial_values=_initial_values(arguments.initial_values),
             )
         elif arguments.command == "approve":

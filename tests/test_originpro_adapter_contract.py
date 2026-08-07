@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 import io
 import tempfile
@@ -12,14 +13,15 @@ import zipfile
 
 from origin_fit.execution import (
     DeterministicFakeOriginAdapter,
+    OriginGraphTemplate,
     OriginExecutionRequest,
     OriginFittedCurve,
     OriginSeriesInput,
 )
 from origin_fit.remote import InProcessWorkerTransport, RemoteOriginExecutor
 from origin_fit.storage import LocalStore
-from origin_worker.service import OriginWorker
 from tests.test_origin_remote import approved_fixture
+from tests.test_support import make_worker
 
 
 PARAMETERS = {
@@ -232,6 +234,8 @@ class _FakeOriginPro:
         self.report_calls: list[tuple[str, str]] = []
         self.report_sheets: dict[str, _FakeWorksheet] = {}
         self.find_sheet_calls: list[tuple[str, str]] = []
+        self.graph_template_calls: list[str | None] = []
+        self.fail_template_render = False
         self.block_first_fit = False
         self.blocked_once = False
         self.fit_started = threading.Event()
@@ -281,6 +285,11 @@ class _FakeOriginPro:
         return self.report_sheets[range]
 
     def new_graph(self, **kwargs: object) -> _FakeGraph:
+        self.graph_template_calls.append(
+            kwargs.get("template") if isinstance(kwargs.get("template"), str) else None
+        )
+        if self.fail_template_render and kwargs.get("template") is not None:
+            raise RuntimeError("sensitive template render failure")
         del kwargs
         graph = _FakeGraph(self)
         self.graphs.append(graph)
@@ -486,6 +495,110 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             (901.0, 900.0, 899.0, 898.0, 897.0, 896.0),
         )
 
+    async def test_production_adapter_renders_with_the_registered_template(
+        self,
+    ) -> None:
+        from origin_worker.originpro_adapter import OriginProAdapter
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            template_path = Path(temporary_directory) / "graph-template.otpu"
+            template_path.write_bytes(b"ORIGIN-GRAPH-TEMPLATE-CONTENT\n")
+            digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
+            originpro = _FakeOriginPro()
+            adapter = OriginProAdapter(originpro_module=originpro, visible=True)
+            artifacts = None
+            try:
+                responses = await adapter.execute(
+                    _request(),
+                    OriginGraphTemplate(
+                        template_id="template:standard",
+                        version=1,
+                        sha256=digest,
+                        graph_profile="expdec2-standard@1.0",
+                        path=template_path,
+                    ),
+                )
+                artifacts = adapter.take_artifacts()
+            finally:
+                adapter.terminate()
+
+            self.assertEqual(
+                [item.status for item in responses], ["succeeded"] * 2
+            )
+            self.assertEqual(
+                originpro.graph_template_calls[-1], str(template_path)
+            )
+            assert artifacts is not None
+            self.assertEqual(artifacts.png, b"REAL-PNG")
+            self.assertEqual(artifacts.pdf, b"REAL-PDF")
+            self.assertEqual(artifacts.opju, b"REAL-OPJU")
+
+    async def test_production_adapter_rejects_a_template_mismatching_its_hash(
+        self,
+    ) -> None:
+        from origin_worker.originpro_adapter import (
+            OriginProAdapter,
+            OriginProAdapterError,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            template_path = Path(temporary_directory) / "graph-template.otpu"
+            template_path.write_bytes(b"ORIGIN-GRAPH-TEMPLATE-CONTENT\n")
+            originpro = _FakeOriginPro()
+            adapter = OriginProAdapter(originpro_module=originpro)
+            try:
+                with self.assertRaises(OriginProAdapterError) as raised:
+                    await adapter.execute(
+                        _request(),
+                        OriginGraphTemplate(
+                            template_id="template:standard",
+                            version=1,
+                            sha256="0" * 64,
+                            graph_profile="expdec2-standard@1.0",
+                            path=template_path,
+                        ),
+                    )
+            finally:
+                adapter.terminate()
+
+            self.assertEqual(
+                raised.exception.code, "template_integrity_error"
+            )
+            self.assertIsNone(adapter.take_artifacts())
+
+    async def test_template_render_failure_is_safe_and_never_silently_falls_back(
+        self,
+    ) -> None:
+        from origin_worker.originpro_adapter import (
+            OriginProAdapter,
+            OriginProAdapterError,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            template_path = Path(temporary_directory) / "graph-template.otpu"
+            template_path.write_bytes(b"ORIGIN-GRAPH-TEMPLATE-CONTENT\n")
+            digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
+            originpro = _FakeOriginPro()
+            originpro.fail_template_render = True
+            adapter = OriginProAdapter(originpro_module=originpro)
+            try:
+                with self.assertRaises(OriginProAdapterError) as raised:
+                    await adapter.execute(
+                        _request(),
+                        OriginGraphTemplate(
+                            template_id="template:standard",
+                            version=1,
+                            sha256=digest,
+                            graph_profile="expdec2-standard@1.0",
+                            path=template_path,
+                        ),
+                    )
+            finally:
+                adapter.terminate()
+
+            self.assertEqual(raised.exception.code, "template_render_failed")
+            self.assertIsNone(adapter.take_artifacts())
+
     async def test_terminate_closes_only_the_owned_origin_instance(self) -> None:
         from origin_worker.originpro_adapter import OriginProAdapter
 
@@ -575,7 +688,7 @@ class OriginProAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
             adapter = ArtifactAdapter()
-            worker = OriginWorker(root / "worker", adapter)
+            worker = make_worker(root / "worker", adapter)
             submission = RemoteOriginExecutor(
                 InProcessWorkerTransport(worker)
             ).prepare_submission(store, snapshot_id, recipe_id)

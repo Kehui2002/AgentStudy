@@ -8,6 +8,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from tests.test_support import (
+    TEMPLATE_ID,
+    TEMPLATE_SHA256,
+    TEMPLATE_VERSION,
+    template_cli_arguments,
+)
+from origin_fit.storage import LocalStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +132,7 @@ class OriginFitCliTests(unittest.TestCase):
             "origin-auto",
             "--graph-profile",
             "expdec2-standard@1.0",
+            *template_cli_arguments(),
         )
 
     def test_import_creates_an_immutable_snapshot_with_a_bounded_summary(self) -> None:
@@ -443,6 +453,14 @@ class OriginFitCliTests(unittest.TestCase):
                 {"id": "expdec2-standard", "version": "1.0"},
             )
             self.assertEqual(
+                specification["fit_specification"]["graph_template"],
+                {
+                    "template_id": TEMPLATE_ID,
+                    "version": TEMPLATE_VERSION,
+                    "sha256": TEMPLATE_SHA256,
+                },
+            )
+            self.assertEqual(
                 specification["fit_specification"]["constraints"],
                 {
                     "y0": {"lower": None, "upper": None},
@@ -563,6 +581,7 @@ class OriginFitCliTests(unittest.TestCase):
                 str(values_path),
                 "--graph-profile",
                 "expdec2-standard@1.0",
+                *template_cli_arguments(),
             )
             inspected = self.run_cli(
                 state_dir, "inspect", proposed["fit_specification_id"]
@@ -592,9 +611,93 @@ class OriginFitCliTests(unittest.TestCase):
                 str(values_path),
                 "--graph-profile",
                 "expdec2-standard@1.0",
+                *template_cli_arguments(),
                 succeeds=False,
             )
             self.assertEqual(error["error"], "invalid_fit_specification")
+
+    def test_propose_requires_an_explicit_template_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = Path(temporary_directory) / "state"
+            snapshot = self.import_fixture(state_dir)
+            malformed = self.run_cli(
+                state_dir,
+                "propose",
+                snapshot["dataset_snapshot_id"],
+                "--experiment-id",
+                "synthetic-expdec2",
+                "--fit-min",
+                "0",
+                "--fit-max",
+                "11",
+                "--weighting",
+                "instrument",
+                "--initialization",
+                "origin-auto",
+                "--graph-profile",
+                "expdec2-standard@1.0",
+                "--template",
+                "template:standard@1",
+                "--template-sha256",
+                "not-a-sha256",
+                succeeds=False,
+            )
+            self.assertEqual(malformed["error"], "invalid_fit_specification")
+
+    def test_approve_rejects_a_specification_without_a_template_selection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = Path(temporary_directory) / "state"
+            snapshot = self.import_fixture(state_dir)
+            proposed = self.propose_fixture(
+                state_dir, snapshot["dataset_snapshot_id"]
+            )
+            store = LocalStore(state_dir)
+            with store.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id, specification_json FROM fit_specifications
+                    WHERE id = ?
+                    """,
+                    (proposed["fit_specification_id"],),
+                ).fetchone()
+                specification = json.loads(row["specification_json"])
+                del specification["graph_template"]
+                connection.execute(
+                    """
+                    UPDATE fit_specifications SET specification_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(specification, sort_keys=True),
+                        proposed["fit_specification_id"],
+                    ),
+                )
+
+            error = self.run_cli(
+                state_dir,
+                "approve",
+                proposed["fit_specification_id"],
+                succeeds=False,
+            )
+            self.assertEqual(error["error"], "invalid_fit_specification")
+
+    def test_templates_command_requires_worker_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_dir = Path(temporary_directory) / "state"
+            with patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("ORIGIN_WORKER_TOKEN", None)
+                error = self.run_cli(
+                    state_dir,
+                    "templates",
+                    "--worker-url",
+                    "https://192.168.56.1:8443",
+                    "--worker-certificate",
+                    "/tmp/missing.crt",
+                    succeeds=False,
+                )
+            self.assertEqual(error["error"], "missing_configuration")
 
     def test_propose_rejects_an_invalid_fit_range_or_weighting_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -617,6 +720,7 @@ class OriginFitCliTests(unittest.TestCase):
                 "origin-auto",
                 "--graph-profile",
                 "expdec2-standard@1.0",
+                *template_cli_arguments(),
                 succeeds=False,
             )
             self.assertEqual(range_error["error"], "invalid_fit_specification")
@@ -642,6 +746,7 @@ class OriginFitCliTests(unittest.TestCase):
                 "origin-auto",
                 "--graph-profile",
                 "expdec2-standard@1.0",
+                *template_cli_arguments(),
                 succeeds=False,
             )
             self.assertEqual(weighting_error["error"], "invalid_fit_specification")

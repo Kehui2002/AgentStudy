@@ -17,6 +17,7 @@ import uuid
 from pydantic import ValidationError
 
 from origin_fit.contracts import (
+    GraphTemplateCapability,
     GraphProfileCapability,
     WorkerCapabilities,
     WorkerJob,
@@ -25,6 +26,7 @@ from origin_fit.contracts import (
 from origin_fit.errors import OriginFitError
 from origin_fit.execution import (
     OriginAdapter,
+    OriginGraphTemplate,
     execute_approved_fit,
     load_approved_fit_execution_request,
 )
@@ -32,6 +34,8 @@ from origin_fit.storage import LocalStore, utc_now
 from origin_fit.specifications import REQUIRED_OUTPUTS
 
 from .bundle import build_result_bundle
+from .originpro_adapter import OriginProAdapterError
+from .templates import GraphTemplateRegistry, TemplateError
 
 
 class WorkerError(Exception):
@@ -54,6 +58,7 @@ class OriginWorker:
         max_y_series: int = 20,
         job_timeout: float = 30 * 60,
         workspace_retention_days: int = 7,
+        template_registry: GraphTemplateRegistry | None = None,
     ) -> None:
         if workspace_retention_days < 0:
             raise ValueError("workspace_retention_days must not be negative")
@@ -67,7 +72,6 @@ class OriginWorker:
         self.max_submission_bytes = ((max_dataset_bytes + 2) // 3) * 4 + 1024 * 1024
         self.job_timeout = job_timeout
         self.workspace_retention_days = workspace_retention_days
-        self._queue_lock = asyncio.Lock()
         state_dir.mkdir(parents=True, exist_ok=True)
         if state_dir.is_symlink():
             raise WorkerError(
@@ -85,6 +89,8 @@ class OriginWorker:
                 "invalid_workspace_root",
                 "Worker jobs directory must remain inside Worker state.",
             )
+        self.template_registry = template_registry or GraphTemplateRegistry(state_dir)
+        self._queue_lock = asyncio.Lock()
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -164,6 +170,20 @@ class OriginWorker:
             connection.close()
 
     def capabilities(self) -> WorkerCapabilities:
+        templates = [
+            GraphTemplateCapability(
+                template_id=record["template_id"],
+                version=record["version"],
+                sha256=record["sha256"],
+                graph_profile=GraphProfileCapability(
+                    id=record["graph_profile"]["id"],
+                    version=record["graph_profile"]["version"],
+                ),
+                originpro_min_version=record["originpro_min_version"],
+                originpro_max_version=record["originpro_max_version"],
+            )
+            for record in self.template_registry.active_versions()
+        ]
         capabilities = WorkerCapabilities(
             transport_schema_version="1.0",
             fit_specification_schema_versions=["1.0"],
@@ -173,6 +193,7 @@ class OriginWorker:
             graph_profiles=[
                 GraphProfileCapability(id="expdec2-standard", version="1.0")
             ],
+            graph_templates=templates,
             max_dataset_bytes=self.max_dataset_bytes,
             max_rows=self.max_rows,
             max_y_series=self.max_y_series,
@@ -187,6 +208,7 @@ class OriginWorker:
                     "transport_schema_version": capabilities.transport_schema_version,
                     "fit_result_schema_versions": capabilities.fit_result_schema_versions,
                     "manifest_schema_versions": capabilities.manifest_schema_versions,
+                    "graph_template_count": len(templates),
                 },
             )
         return capabilities
@@ -471,6 +493,7 @@ class OriginWorker:
                 "Submission is incompatible with Worker capabilities.",
             )
         graph_profile = specification.get("graph_profile", {})
+        graph_template = specification.get("graph_template", {})
         model = specification.get("model", {})
         recipe_version = recipe.get("version")
         if (
@@ -492,6 +515,7 @@ class OriginWorker:
                 "incompatible_submission",
                 "Submission is incompatible with Worker capabilities.",
             )
+        self._validate_graph_template(graph_template)
         canonical_recipe = json.dumps(
             recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -559,6 +583,59 @@ class OriginWorker:
             )
         return dataset
 
+    def _validate_graph_template(self, graph_template: object) -> None:
+        if not isinstance(graph_template, dict):
+            raise WorkerError(
+                "template_selection_required",
+                "Approved Fit Recipe must explicitly select a Registered Origin Graph Template.",
+            )
+        template_id = graph_template.get("template_id")
+        version = graph_template.get("version")
+        sha256 = graph_template.get("sha256")
+        if (
+            not isinstance(template_id, str)
+            or not template_id.startswith("template:")
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 1
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+        ):
+            raise WorkerError(
+                "template_selection_required",
+                "Approved Fit Recipe template selection must include id, version, and sha256.",
+            )
+        try:
+            record = self.template_registry.get(template_id, version)
+        except TemplateError:
+            record = None
+        if record is None:
+            raise WorkerError(
+                "template_not_found",
+                f"Registered Origin Graph Template '{template_id}@{version}' is not registered.",
+            )
+        if not record["active"]:
+            raise WorkerError(
+                "template_deactivated",
+                f"Registered Origin Graph Template '{template_id}@{version}' is deactivated.",
+            )
+        if (
+            record["sha256"] != sha256
+            or record["graph_profile"]["id"] != "expdec2-standard"
+            or record["graph_profile"]["version"] != "1.0"
+        ):
+            raise WorkerError(
+                "template_hash_mismatch",
+                "Approved Fit Recipe template hash or Graph Profile does not match the registered template.",
+            )
+        try:
+            self.template_registry.content(template_id, version)
+        except TemplateError:
+            raise WorkerError(
+                "template_integrity_error",
+                "Registered Origin Graph Template content failed integrity verification.",
+            ) from None
+
     def _start_next(self) -> str | None:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -598,6 +675,9 @@ class OriginWorker:
                 submission.dataset_snapshot_id,
                 submission.approved_fit_recipe_id,
             )
+            graph_template = self._materialize_graph_template(
+                workspace, submission
+            )
             result = await asyncio.wait_for(
                 execute_approved_fit(
                     execution_store,
@@ -605,6 +685,7 @@ class OriginWorker:
                     submission.approved_fit_recipe_id,
                     self.adapter,
                     fit_job_id=worker_job_id,
+                    graph_template=graph_template,
                 ),
                 timeout=self.job_timeout,
             )
@@ -652,6 +733,9 @@ class OriginWorker:
                 "worker_timeout",
                 "Fit Job exceeded the Worker execution timeout.",
             )
+        except OriginProAdapterError as error:
+            self._terminate_if_running(worker_job_id)
+            self._fail(worker_job_id, error.code, error.message)
         except (OriginFitError, WorkerError, ValidationError) as error:
             self._terminate_if_running(worker_job_id)
             code = getattr(error, "code", "invalid_submission")
@@ -664,6 +748,50 @@ class OriginWorker:
                 "worker_execution_error",
                 "Worker could not complete the Fit Job.",
             )
+
+    def _materialize_graph_template(
+        self,
+        workspace: Path,
+        submission: WorkerSubmission,
+    ) -> OriginGraphTemplate:
+        specification = submission.approved_fit_recipe["fit_specification"]
+        selection = specification["graph_template"]
+        record = self.template_registry.get(
+            selection["template_id"], selection["version"]
+        )
+        if record is None:
+            raise WorkerError(
+                "template_not_found",
+                f"Registered Origin Graph Template "
+                f"'{selection['template_id']}@{selection['version']}' is not registered.",
+            )
+        if not record["active"]:
+            raise WorkerError(
+                "template_deactivated",
+                f"Registered Origin Graph Template "
+                f"'{selection['template_id']}@{selection['version']}' is deactivated.",
+            )
+        if record["sha256"] != selection["sha256"]:
+            raise WorkerError(
+                "template_hash_mismatch",
+                "Registered Origin Graph Template hash does not match the Approved Fit Recipe.",
+            )
+        content = self.template_registry.content(
+            selection["template_id"], selection["version"]
+        )
+        path = workspace / f"graph-template-{selection['sha256']}.otpu"
+        path.write_bytes(content)
+        path.chmod(0o444)
+        return OriginGraphTemplate(
+            template_id=selection["template_id"],
+            version=selection["version"],
+            sha256=selection["sha256"],
+            graph_profile=(
+                f"{record['graph_profile']['id']}@"
+                f"{record['graph_profile']['version']}"
+            ),
+            path=path,
+        )
 
     def _terminate_if_running(self, worker_job_id: str) -> None:
         with self.connect() as connection:

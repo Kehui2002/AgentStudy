@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import importlib
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from origin_fit.execution import (
+    OriginGraphTemplate,
     OriginExecutionRequest,
     OriginFittedCurve,
     OriginGraphArtifacts,
@@ -43,6 +45,11 @@ _CONSTRAINT_POLICY = {
 
 class OriginProAdapterError(RuntimeError):
     """A Worker-facing OriginPro installation or artifact failure."""
+
+    def __init__(self, message: str, *, code: str = "origin_adapter_error") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,25 +109,31 @@ class OriginProAdapter:
         )
 
     async def execute(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None = None,
     ) -> tuple[OriginSeriesResponse, ...]:
         """Run every Y independently and preserve an ordered partial outcome."""
 
         self._validate_request(request)
-        future = self._executor.submit(self._execute_serialized, request)
+        future = self._executor.submit(
+            self._execute_serialized, request, graph_template
+        )
         while not future.done():
             await asyncio.sleep(0.01)
         return future.result()
 
     def _execute_serialized(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None,
     ) -> tuple[OriginSeriesResponse, ...]:
         with self._origin_lock:
             if self._discard_instance.is_set():
                 self._close_owned_instance()
                 self._discard_instance.clear()
             try:
-                return self._execute_sync(request)
+                return self._execute_sync(request, graph_template)
             finally:
                 if self._discard_instance.is_set():
                     self._artifacts = None
@@ -128,7 +141,9 @@ class OriginProAdapter:
                     self._discard_instance.clear()
 
     def _execute_sync(
-        self, request: OriginExecutionRequest
+        self,
+        request: OriginExecutionRequest,
+        graph_template: OriginGraphTemplate | None,
     ) -> tuple[OriginSeriesResponse, ...]:
         if self._owns_instance:
             self._op.new(asksave=False)
@@ -154,7 +169,7 @@ class OriginProAdapter:
                 fitted_curves[series.series_name] = fitted_curve
 
         self._artifacts = self._render_artifacts(
-            request, worksheet, columns, fitted_curves
+            request, worksheet, columns, fitted_curves, graph_template
         )
         return tuple(outcomes)
 
@@ -523,52 +538,60 @@ class OriginProAdapter:
         worksheet: Any,
         columns: _ColumnLayout,
         fitted_curves: dict[str, _OriginFittedCurve],
+        graph_template: OriginGraphTemplate | None,
     ) -> OriginGraphArtifacts:
-        graph = self._op.new_graph(
-            lname="ExpDec2 Combined Fit", template="Origin", hidden=not self._visible
-        )
-        if graph is None:
-            raise OriginProAdapterError(
-                "OriginPro could not create the combined graph."
+        try:
+            template_path = self._materialized_template(graph_template)
+            graph = self._op.new_graph(
+                lname="ExpDec2 Combined Fit",
+                template=str(template_path) if template_path is not None else "Origin",
+                hidden=not self._visible,
             )
-        layer = graph[0]
-        for index, series in enumerate(request.series):
-            color = _COLORS[index % len(_COLORS)]
-            observed = layer.add_plot(
-                worksheet,
-                columns.y_by_series[series.series_name],
-                columns.x,
-                type="s",
-            )
-            observed.color = color
-            observed.symbol_kind = 3
-            observed.symbol_size = 5
-            curve = fitted_curves.get(series.series_name)
-            if curve is None:
-                continue
-            fitted = layer.add_plot(
-                curve.worksheet, curve.y_column, curve.x_column, type="l"
-            )
-            fitted.color = color
-        layer.axis("x").title = _axis_title("X", request.x_unit)
-        layer.axis("y").title = _y_axis_title(request)
-        layer.rescale()
-        layer.lt_exec("legend -c")
-
-        with tempfile.TemporaryDirectory(prefix="origin-fit-artifacts-") as directory:
-            root = Path(directory)
-            png_path = root / "combined.png"
-            pdf_path = root / "combined.pdf"
-            opju_path = root / "project.opju"
-            if not graph.save_fig(str(png_path), type="png", replace=True, width=1800):
-                raise OriginProAdapterError("OriginPro could not export the PNG graph.")
-            if not graph.save_fig(str(pdf_path), type="pdf", replace=True):
-                raise OriginProAdapterError("OriginPro could not export the PDF graph.")
-            if not self._op.save(str(opju_path)):
+            if graph is None:
                 raise OriginProAdapterError(
-                    "OriginPro could not save the OPJU project."
+                    "OriginPro could not create the combined graph."
                 )
-            try:
+            layer = graph[0]
+            for index, series in enumerate(request.series):
+                color = _COLORS[index % len(_COLORS)]
+                observed = layer.add_plot(
+                    worksheet,
+                    columns.y_by_series[series.series_name],
+                    columns.x,
+                    type="s",
+                )
+                observed.color = color
+                observed.symbol_kind = 3
+                observed.symbol_size = 5
+                curve = fitted_curves.get(series.series_name)
+                if curve is None:
+                    continue
+                fitted = layer.add_plot(
+                    curve.worksheet, curve.y_column, curve.x_column, type="l"
+                )
+                fitted.color = color
+            layer.axis("x").title = _axis_title("X", request.x_unit)
+            layer.axis("y").title = _y_axis_title(request)
+            layer.rescale()
+            layer.lt_exec("legend -c")
+
+            with tempfile.TemporaryDirectory(prefix="origin-fit-artifacts-") as directory:
+                root = Path(directory)
+                png_path = root / "combined.png"
+                pdf_path = root / "combined.pdf"
+                opju_path = root / "project.opju"
+                if not graph.save_fig(str(png_path), type="png", replace=True, width=1800):
+                    raise OriginProAdapterError(
+                        "OriginPro could not export the PNG graph."
+                    )
+                if not graph.save_fig(str(pdf_path), type="pdf", replace=True):
+                    raise OriginProAdapterError(
+                        "OriginPro could not export the PDF graph."
+                    )
+                if not self._op.save(str(opju_path)):
+                    raise OriginProAdapterError(
+                        "OriginPro could not save the OPJU project."
+                    )
                 return OriginGraphArtifacts(
                     graph_profile=_GRAPH_PROFILE,
                     png=png_path.read_bytes(),
@@ -584,10 +607,43 @@ class OriginProAdapter:
                         if series.series_name in fitted_curves
                     ),
                 )
-            except OSError as error:
+        except OriginProAdapterError as error:
+            if graph_template is not None and error.code == "origin_adapter_error":
                 raise OriginProAdapterError(
-                    "OriginPro did not create all required graph artifacts."
+                    error.message, code="template_render_failed"
                 ) from error
+            raise error
+        except (OSError, RuntimeError) as error:
+            code = (
+                "template_render_failed"
+                if graph_template is not None
+                else "origin_adapter_error"
+            )
+            raise OriginProAdapterError(
+                "OriginPro could not render the required graph artifacts.",
+                code=code,
+            ) from error
+
+    @staticmethod
+    def _materialized_template(
+        graph_template: OriginGraphTemplate | None,
+    ) -> Path | None:
+        if graph_template is None or graph_template.path is None:
+            return None
+        path = graph_template.path
+        try:
+            content = path.read_bytes()
+        except OSError as error:
+            raise OriginProAdapterError(
+                "Registered Origin Graph Template copy is unavailable.",
+                code="template_integrity_error",
+            ) from error
+        if hashlib.sha256(content).hexdigest() != graph_template.sha256:
+            raise OriginProAdapterError(
+                "Registered Origin Graph Template copy does not match its content hash.",
+                code="template_integrity_error",
+            )
+        return path
 
 
 def _is_number(value: object) -> bool:

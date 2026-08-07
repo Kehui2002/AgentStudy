@@ -33,6 +33,15 @@ class GraphProfileCapability(StrictModel):
     version: str
 
 
+class GraphTemplateCapability(StrictModel):
+    template_id: str
+    version: int
+    sha256: str
+    graph_profile: GraphProfileCapability
+    originpro_min_version: float
+    originpro_max_version: float
+
+
 class WorkerCapabilities(StrictModel):
     transport_schema_version: str
     fit_specification_schema_versions: list[str]
@@ -40,6 +49,7 @@ class WorkerCapabilities(StrictModel):
     manifest_schema_versions: list[str]
     models: list[str]
     graph_profiles: list[GraphProfileCapability]
+    graph_templates: list[GraphTemplateCapability]
     max_dataset_bytes: int
     max_rows: int
     max_y_series: int
@@ -85,6 +95,12 @@ class ManifestSpecification(ManifestObject):
     schema_version: str
 
 
+class ManifestTemplate(StrictModel):
+    template_id: str
+    version: int
+    sha256: str
+
+
 class ManifestSoftware(StrictModel):
     worker: str
     adapter: str
@@ -105,6 +121,7 @@ class FitResultManifest(StrictModel):
     dataset_snapshot: ManifestObject
     approved_fit_recipe: ManifestRecipe
     fit_specification: ManifestSpecification
+    graph_template: ManifestTemplate
     software: ManifestSoftware
     graph_profile: GraphProfileCapability
     schemas: ManifestSchemas

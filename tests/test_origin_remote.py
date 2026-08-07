@@ -16,6 +16,7 @@ from origin_fit.execution import (
     DeterministicFakeOriginAdapter,
     FakeOriginAdapter,
     OriginExecutionRequest,
+    OriginGraphTemplate,
     OriginSeriesResponse,
 )
 from origin_fit.contracts import WorkerCapabilities
@@ -33,10 +34,10 @@ from origin_fit.specifications import (
     propose_fit_specification,
 )
 from origin_fit.storage import LocalStore
-from origin_worker.service import OriginWorker
 from origin_worker.service import WorkerError
 from origin_worker.api import create_app
 from origin_worker.cli import main as origin_worker_main
+from tests.test_support import TEMPLATE_ID, TEMPLATE_SHA256, TEMPLATE_VERSION, make_worker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,9 @@ def approved_fixture(store: LocalStore) -> tuple[str, str]:
         initialization="origin-auto",
         graph_profile_id="expdec2-standard",
         graph_profile_version="1.0",
+        template_id=TEMPLATE_ID,
+        template_version=TEMPLATE_VERSION,
+        template_sha256=TEMPLATE_SHA256,
     )
     recipe = approve_fit_specification(
         store, specification["fit_specification_id"]
@@ -118,7 +122,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(
+            worker = make_worker(
                 root / "worker",
                 FakeOriginAdapter(
                     [
@@ -224,7 +228,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             executor = RemoteOriginExecutor(
-                InProcessWorkerTransport(OriginWorker(root / "worker", adapter))
+                InProcessWorkerTransport(make_worker(root / "worker", adapter))
             )
 
             first = await executor.execute_approved_fit(
@@ -242,9 +246,13 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_timeout_returns_pending_and_can_be_resumed(self) -> None:
         class SlowAdapter(FakeOriginAdapter):
-            async def execute(self, request):  # type: ignore[no-untyped-def]
+            async def execute(
+                self,
+                request: OriginExecutionRequest,
+                graph_template: OriginGraphTemplate | None = None,
+            ) -> tuple[OriginSeriesResponse, ...]:
                 await asyncio.sleep(0.05)
-                return await super().execute(request)
+                return await super().execute(request, graph_template)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -264,7 +272,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             executor = RemoteOriginExecutor(
-                InProcessWorkerTransport(OriginWorker(root / "worker", adapter))
+                InProcessWorkerTransport(make_worker(root / "worker", adapter))
             )
 
             pending = await executor.execute_approved_fit(
@@ -289,11 +297,13 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.release = asyncio.Event()
 
             async def execute(
-                self, request: OriginExecutionRequest
+                self,
+                request: OriginExecutionRequest,
+                graph_template: OriginGraphTemplate | None = None,
             ) -> tuple[OriginSeriesResponse, ...]:
                 self.started.set()
                 await self.release.wait()
-                return await super().execute(request)
+                return await super().execute(request, graph_template)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -313,14 +323,14 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             worker_state = root / "worker"
-            worker = OriginWorker(worker_state, adapter)
+            worker = make_worker(worker_state, adapter)
             executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
             submission = executor.prepare_submission(store, snapshot_id, recipe_id)
             job = worker.submit(submission, "restart-test")
             running = asyncio.create_task(worker.run_queued())
             await adapter.started.wait()
 
-            restarted = OriginWorker(worker_state, FakeOriginAdapter([]))
+            restarted = make_worker(worker_state, FakeOriginAdapter([]))
             recovered_job = restarted.get_job(job.worker_job_id)
 
             self.assertEqual(recovered_job.status, "failed")
@@ -351,17 +361,17 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             worker_state = root / "worker"
-            first_process = OriginWorker(worker_state, adapter)
+            first_process = make_worker(worker_state, adapter)
             executor = RemoteOriginExecutor(InProcessWorkerTransport(first_process))
             submission = executor.prepare_submission(store, snapshot_id, recipe_id)
             job = first_process.submit(submission, "queued-test")
 
-            restarted = OriginWorker(worker_state, adapter)
+            restarted = make_worker(worker_state, adapter)
             self.assertEqual(restarted.get_job(job.worker_job_id).status, "queued")
             cancelled = restarted.cancel(job.worker_job_id)
             self.assertEqual(cancelled.status, "cancelled")
 
-            restarted_again = OriginWorker(worker_state, adapter)
+            restarted_again = make_worker(worker_state, adapter)
             self.assertEqual(
                 restarted_again.get_job(job.worker_job_id).status, "cancelled"
             )
@@ -387,12 +397,12 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             worker_state = root / "worker"
-            first_process = OriginWorker(worker_state, adapter)
+            first_process = make_worker(worker_state, adapter)
             executor = RemoteOriginExecutor(InProcessWorkerTransport(first_process))
             submission = executor.prepare_submission(store, snapshot_id, recipe_id)
             submitted = first_process.submit(submission, "startup-resume-test")
 
-            restarted = OriginWorker(worker_state, adapter)
+            restarted = make_worker(worker_state, adapter)
             app = create_app(restarted, bearer_token="test-secret-token")
             async with app.router.lifespan_context(app):
                 for _ in range(100):
@@ -415,6 +425,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                     graph_profiles=[
                         {"id": "expdec2-standard", "version": "1.0"}
                     ],
+                    graph_templates=[],
                     max_dataset_bytes=100 * 1024 * 1024,
                     max_rows=1_000_000,
                     max_y_series=20,
@@ -432,6 +443,178 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 await executor.execute_approved_fit(store, snapshot_id, recipe_id)
 
             self.assertEqual(raised.exception.code, "incompatible_worker")
+
+    async def test_rejects_template_selection_missing_or_mismatched_in_capabilities(
+        self,
+    ) -> None:
+        def capabilities_without_template() -> WorkerCapabilities:
+            capabilities = delegate_worker.capabilities()
+            return capabilities.model_copy(update={"graph_templates": []})
+
+        def capabilities_with_wrong_hash() -> WorkerCapabilities:
+            capabilities = delegate_worker.capabilities()
+            return capabilities.model_copy(
+                update={
+                    "graph_templates": [
+                        item.model_copy(
+                            update={"sha256": "0" * 64}
+                        )
+                        for item in capabilities.graph_templates
+                    ]
+                }
+            )
+
+        class TemplateCapabilityTransport:
+            def __init__(self, capabilities_factory):  # type: ignore[no-untyped-def]
+                self.capabilities_factory = capabilities_factory
+                self.submit_called = False
+
+            async def capabilities(self) -> WorkerCapabilities:
+                return self.capabilities_factory()
+
+            async def submit(self, submission, idempotency_key):  # type: ignore[no-untyped-def]
+                self.submit_called = True
+                raise AssertionError("incompatible submission reached Worker")
+
+        for name, factory in (
+            ("missing", capabilities_without_template),
+            ("wrong_hash", capabilities_with_wrong_hash),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                store = LocalStore(root / "linux")
+                snapshot_id, recipe_id = approved_fixture(store)
+                delegate_worker = make_worker(
+                    root / "worker", DeterministicFakeOriginAdapter()
+                )
+                transport = TemplateCapabilityTransport(factory)
+                executor = RemoteOriginExecutor(transport)  # type: ignore[arg-type]
+
+                with self.assertRaises(OriginFitError) as raised:
+                    await executor.execute_approved_fit(
+                        store, snapshot_id, recipe_id
+                    )
+
+                self.assertEqual(raised.exception.code, "incompatible_worker")
+                self.assertFalse(transport.submit_called)
+
+    async def test_bundle_manifest_records_template_provenance_and_rejects_tampering(
+        self,
+    ) -> None:
+        def rewrite_manifest_template(content: bytes) -> bytes:
+            with zipfile.ZipFile(io.BytesIO(content)) as source:
+                members = {name: source.read(name) for name in source.namelist()}
+            manifest = json.loads(members["manifest.json"])
+            manifest["graph_template"]["sha256"] = "f" * 64
+            manifest_bytes = json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            manifest["files"]["manifest.json"] = hashlib.sha256(
+                manifest_bytes
+            ).hexdigest()
+            members["manifest.json"] = json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
+                for name, value in members.items():
+                    target.writestr(name, value)
+            return output.getvalue()
+
+        class InspectingTransport:
+            def __init__(self, delegate, transform=None):  # type: ignore[no-untyped-def]
+                self.delegate = delegate
+                self.transform = transform
+                self.manifest: dict | None = None
+
+            async def capabilities(self):  # type: ignore[no-untyped-def]
+                return await self.delegate.capabilities()
+
+            async def submit(self, submission, idempotency_key):  # type: ignore[no-untyped-def]
+                return await self.delegate.submit(submission, idempotency_key)
+
+            async def status(self, worker_job_id):  # type: ignore[no-untyped-def]
+                return await self.delegate.status(worker_job_id)
+
+            async def download_bundle(self, worker_job_id):  # type: ignore[no-untyped-def]
+                original = await self.delegate.download_bundle(worker_job_id)
+                with zipfile.ZipFile(io.BytesIO(original)) as archive:
+                    self.manifest = json.loads(archive.read("manifest.json"))
+                if self.transform is None:
+                    return original
+                rewritten = self.transform(original)
+                return rewritten
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = LocalStore(root / "linux")
+            snapshot_id, recipe_id = approved_fixture(store)
+            adapter = FakeOriginAdapter(
+                [
+                    successful_response(
+                        "decay_a", y0=1.0, a1=7.0, t1=1.5, a2=4.0, t2=8.0
+                    ),
+                    successful_response(
+                        "decay_b", y0=0.8, a1=5.0, t1=1.0, a2=3.2, t2=6.0
+                    ),
+                    successful_response(
+                        "decay_c", y0=1.5, a1=9.0, t1=0.8, a2=4.5, t2=5.0
+                    ),
+                ]
+            )
+            happy_transport = InspectingTransport(
+                InProcessWorkerTransport(make_worker(root / "worker", adapter))
+            )
+            outcome = await RemoteOriginExecutor(happy_transport).execute_approved_fit(
+                store,
+                snapshot_id,
+                recipe_id,
+                wait_timeout=2,
+                poll_interval=0.01,
+            )
+            self.assertIsInstance(outcome, ArchivedFitResult)
+            assert happy_transport.manifest is not None
+            self.assertEqual(
+                happy_transport.manifest["graph_template"],
+                {
+                    "template_id": "template:standard",
+                    "version": 1,
+                    "sha256": hashlib.sha256(
+                        b"ORIGIN-GRAPH-TEMPLATE-CONTENT\n"
+                    ).hexdigest(),
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = LocalStore(root / "linux")
+            snapshot_id, recipe_id = approved_fixture(store)
+            adapter = FakeOriginAdapter(
+                [
+                    successful_response(
+                        "decay_a", y0=1.0, a1=7.0, t1=1.5, a2=4.0, t2=8.0
+                    ),
+                    successful_response(
+                        "decay_b", y0=0.8, a1=5.0, t1=1.0, a2=3.2, t2=6.0
+                    ),
+                    successful_response(
+                        "decay_c", y0=1.5, a1=9.0, t1=0.8, a2=4.5, t2=5.0
+                    ),
+                ]
+            )
+            tampered_transport = InspectingTransport(
+                InProcessWorkerTransport(make_worker(root / "worker", adapter)),
+                transform=rewrite_manifest_template,
+            )
+            with self.assertRaises(OriginFitError) as raised:
+                await RemoteOriginExecutor(tampered_transport).execute_approved_fit(
+                    store,
+                    snapshot_id,
+                    recipe_id,
+                    wait_timeout=2,
+                    poll_interval=0.01,
+                )
+            self.assertEqual(raised.exception.code, "bundle_integrity_error")
 
     async def test_rejects_missing_extra_and_tampered_bundle_artifacts(self) -> None:
         def rewrite_bundle(
@@ -512,7 +695,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 )
                 transport = BundleTransformTransport(
-                    InProcessWorkerTransport(OriginWorker(root / "worker", adapter)),
+                    InProcessWorkerTransport(make_worker(root / "worker", adapter)),
                     transform,
                 )
                 executor = RemoteOriginExecutor(transport)  # type: ignore[arg-type]
@@ -541,7 +724,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(
+            worker = make_worker(
                 root / "worker",
                 FakeOriginAdapter(
                     [
@@ -590,8 +773,11 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.terminated = 0
 
             async def execute(
-                self, request: OriginExecutionRequest
+                self,
+                request: OriginExecutionRequest,
+                graph_template: OriginGraphTemplate | None = None,
             ) -> tuple[OriginSeriesResponse, ...]:
+                del graph_template
                 await asyncio.Event().wait()
                 raise AssertionError("unreachable")
 
@@ -603,7 +789,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
             adapter = HangingAdapter()
-            worker = OriginWorker(root / "worker", adapter, job_timeout=0.01)
+            worker = make_worker(root / "worker", adapter, job_timeout=0.01)
             executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
             submission = executor.prepare_submission(store, snapshot_id, recipe_id)
             submitted = worker.submit(submission, "timeout-test")
@@ -625,8 +811,11 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.terminated = 0
 
             async def execute(
-                self, request: OriginExecutionRequest
+                self,
+                request: OriginExecutionRequest,
+                graph_template: OriginGraphTemplate | None = None,
             ) -> tuple[OriginSeriesResponse, ...]:
+                del graph_template
                 self.started.set()
                 await self.release.wait()
                 return ()
@@ -640,7 +829,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
             adapter = CancellableAdapter()
-            worker = OriginWorker(root / "worker", adapter)
+            worker = make_worker(root / "worker", adapter)
             executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
             submission = executor.prepare_submission(store, snapshot_id, recipe_id)
             submitted = worker.submit(submission, "cancel-running-test")
@@ -664,15 +853,18 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         class CrashingAdapter:
             async def execute(
-                self, request: OriginExecutionRequest
+                self,
+                request: OriginExecutionRequest,
+                graph_template: OriginGraphTemplate | None = None,
             ) -> tuple[OriginSeriesResponse, ...]:
+                del graph_template
                 raise RuntimeError(secret)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(root / "worker", CrashingAdapter())
+            worker = make_worker(root / "worker", CrashingAdapter())
             executor = RemoteOriginExecutor(InProcessWorkerTransport(worker))
 
             with self.assertRaises(OriginFitError) as raised:
@@ -695,7 +887,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(
+            worker = make_worker(
                 root / "worker",
                 DeterministicFakeOriginAdapter(),
                 workspace_retention_days=0,
@@ -723,7 +915,7 @@ class RemoteOriginExecutionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             store = LocalStore(root / "linux")
             snapshot_id, recipe_id = approved_fixture(store)
-            worker = OriginWorker(
+            worker = make_worker(
                 root / "worker",
                 DeterministicFakeOriginAdapter(),
                 workspace_retention_days=0,

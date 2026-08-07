@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Any
 
 from .errors import OriginFitError
@@ -24,6 +25,8 @@ REQUIRED_OUTPUTS = [
     "manifest.json",
 ]
 APPROVED_GRAPH_PROFILES = {("expdec2-standard", "1.0")}
+_TEMPLATE_ID_PATTERN = re.compile(r"^template:[a-z0-9][a-z0-9-]{0,63}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _canonical_bytes(value: dict) -> bytes:
@@ -47,6 +50,9 @@ def propose_fit_specification(
     initialization: str,
     graph_profile_id: str,
     graph_profile_version: str,
+    template_id: str,
+    template_version: int,
+    template_sha256: str,
     initial_values: dict | None = None,
 ) -> dict:
     initialization_contract: dict[str, Any]
@@ -72,6 +78,17 @@ def propose_fit_specification(
             raise OriginFitError(
                 "invalid_fit_specification",
                 "Graph Profile is not present in the human-maintained approved profile registry.",
+            )
+        if (
+            not _TEMPLATE_ID_PATTERN.fullmatch(template_id)
+            or isinstance(template_version, bool)
+            or not isinstance(template_version, int)
+            or template_version < 1
+            or not _SHA256_PATTERN.fullmatch(template_sha256)
+        ):
+            raise OriginFitError(
+                "invalid_fit_specification",
+                "A Registered Origin Graph Template selection (id, version, sha256) is required.",
             )
         x_minimum = summary["x"]["minimum"]
         x_maximum = summary["x"]["maximum"]
@@ -210,6 +227,11 @@ def propose_fit_specification(
                 "id": graph_profile_id,
                 "version": graph_profile_version,
             },
+            "graph_template": {
+                "template_id": template_id,
+                "version": template_version,
+                "sha256": template_sha256,
+            },
             "output_requirements": REQUIRED_OUTPUTS,
             "experimental_data_contract": {
                 "experiment_id": experiment_id,
@@ -285,6 +307,20 @@ def approve_fit_specification(store: LocalStore, specification_id: str) -> dict:
             raise OriginFitError(
                 "not_found", f"Fit Specification '{specification_id}' not found."
             )
+        specification = json.loads(specification_row["specification_json"])
+        template = specification.get("graph_template")
+        if not (
+            isinstance(template, dict)
+            and _TEMPLATE_ID_PATTERN.fullmatch(str(template.get("template_id", "")))
+            and isinstance(template.get("version"), int)
+            and not isinstance(template.get("version"), bool)
+            and int(template["version"]) >= 1
+            and _SHA256_PATTERN.fullmatch(str(template.get("sha256", "")))
+        ):
+            raise OriginFitError(
+                "invalid_fit_specification",
+                "A Fit Specification must explicitly select a Registered Origin Graph Template before approval.",
+            )
         latest = connection.execute(
             "SELECT COALESCE(MAX(version), 0) AS version FROM approved_fit_recipes"
         ).fetchone()
@@ -295,7 +331,7 @@ def approve_fit_specification(store: LocalStore, specification_id: str) -> dict:
             "version": version,
             "fit_specification_id": specification_row["id"],
             "fit_specification_hash": specification_row["content_hash"],
-            "fit_specification": json.loads(specification_row["specification_json"]),
+            "fit_specification": specification,
             "approved_by": store.operator,
             "approved_at": approved_at,
         }

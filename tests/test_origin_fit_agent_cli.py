@@ -20,7 +20,12 @@ from mini_agent import (
 from origin_fit.agent_cli import run_agent_cli
 from origin_fit.cli import main as origin_fit_main
 from origin_fit.datasets import ImportSelection, import_dataset
-from origin_fit.contracts import WorkerJob
+from origin_fit.contracts import (
+    GraphProfileCapability,
+    GraphTemplateCapability,
+    WorkerCapabilities,
+    WorkerJob,
+)
 from origin_fit.errors import OriginFitError
 from origin_fit.execution import FitRange, FitResult, SeriesFitOutcome
 from origin_fit.remote import ArchivedFitResult, PendingFitJob
@@ -30,6 +35,7 @@ from origin_fit.specifications import (
     propose_fit_specification,
 )
 from origin_fit.storage import LocalStore, utc_now
+from tests.test_support import TEMPLATE_ID, TEMPLATE_SHA256, TEMPLATE_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +103,9 @@ def propose_fixture(store: LocalStore, snapshot_id: str) -> dict:
         initialization="origin_auto",
         graph_profile_id="expdec2-standard",
         graph_profile_version="1.0",
+        template_id=TEMPLATE_ID,
+        template_version=TEMPLATE_VERSION,
+        template_sha256=TEMPLATE_SHA256,
     )
 
 
@@ -132,6 +141,33 @@ class FakeTransport:
         self._jobs = iter(jobs)
         self.status_calls: list[str] = []
         self.cancel_calls: list[str] = []
+
+    async def capabilities(self) -> WorkerCapabilities:
+        return WorkerCapabilities(
+            transport_schema_version="1.0",
+            fit_specification_schema_versions=["1.0"],
+            fit_result_schema_versions=["1.0"],
+            manifest_schema_versions=["1.0"],
+            models=["ExpDec2"],
+            graph_profiles=[
+                GraphProfileCapability(id="expdec2-standard", version="1.0")
+            ],
+            graph_templates=[
+                GraphTemplateCapability(
+                    template_id=TEMPLATE_ID,
+                    version=TEMPLATE_VERSION,
+                    sha256=TEMPLATE_SHA256,
+                    graph_profile=GraphProfileCapability(
+                        id="expdec2-standard", version="1.0"
+                    ),
+                    originpro_min_version=10.2,
+                    originpro_max_version=10.3,
+                )
+            ],
+            max_dataset_bytes=100 * 1024 * 1024,
+            max_rows=1_000_000,
+            max_y_series=20,
+        )
 
     async def status(self, worker_job_id: str) -> WorkerJob:
         self.status_calls.append(worker_job_id)
@@ -177,7 +213,10 @@ class OriginFitAgentCliTests(unittest.IsolatedAsyncioTestCase):
                 model,
                 None,
                 stdin=io.StringIO(
-                    f"select {snapshot_id}\n请为所有三个 Y 序列建议 ExpDec2 拟合\n/quit\n"
+                    f"select {snapshot_id}\n"
+                    f"/template {TEMPLATE_ID}@{TEMPLATE_VERSION} {TEMPLATE_SHA256}\n"
+                    "请为所有三个 Y 序列建议 ExpDec2 拟合\n"
+                    "/quit\n"
                 ),
                 stdout=output,
             )
@@ -195,6 +234,135 @@ class OriginFitAgentCliTests(unittest.IsolatedAsyncioTestCase):
             assert audit is not None
             self.assertIn(
                 "fit_specification.proposed",
+                [event["event_type"] for event in audit["audit_events"]],
+            )
+            self.assertIn(
+                "graph_template.selected",
+                [event["event_type"] for event in audit["audit_events"]],
+            )
+
+    async def test_agent_requires_explicit_template_selection_before_proposal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = LocalStore(Path(temporary_directory) / "state")
+            snapshot_id = import_fixture(store)
+            model = SequenceModel(
+                [
+                    ModelResponse(
+                        parts=[
+                            ToolCallPart(
+                                tool_call_id="proposal-1",
+                                tool_name="propose_expdec2_fit",
+                                arguments_json=json.dumps(
+                                    {
+                                        "experiment_id": "synthetic-expdec2",
+                                        "fit_minimum": 0.0,
+                                        "fit_maximum": 11.0,
+                                        "weighting": "instrument",
+                                        "initialization": "origin_auto",
+                                        "initial_values": None,
+                                    }
+                                ),
+                            )
+                        ]
+                    ),
+                    ModelResponse(
+                        parts=[TextPart("需要先显式选择绘图模板才能提出方案。")]
+                    ),
+                ]
+            )
+            output = io.StringIO()
+
+            await run_agent_cli(
+                store,
+                model,
+                None,
+                stdin=io.StringIO(
+                    f"select {snapshot_id}\n请建议 ExpDec2 拟合\n/quit\n"
+                ),
+                stdout=output,
+            )
+
+            self.assertIn("需要先显式选择绘图模板才能提出方案", output.getvalue())
+            audit = inspect_persisted_object(store, "audit")
+            assert audit is not None
+            self.assertNotIn(
+                "fit_specification.proposed",
+                [event["event_type"] for event in audit["audit_events"]],
+            )
+
+    async def test_templates_command_shows_suggestion_without_selecting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = LocalStore(Path(temporary_directory) / "state")
+            executor = FakeExecutor(
+                OriginFitError("unused", "unused"),
+                transport=FakeTransport([]),
+            )
+            output = io.StringIO()
+
+            await run_agent_cli(
+                store,
+                SequenceModel([]),
+                executor,
+                stdin=io.StringIO("/templates\n/quit\n"),
+                stdout=output,
+            )
+
+            rendered = output.getvalue()
+            self.assertIn(
+                f"Template {TEMPLATE_ID}@{TEMPLATE_VERSION} sha256={TEMPLATE_SHA256}",
+                rendered,
+            )
+            self.assertIn("Suggestion only", rendered)
+            self.assertIn("must still select it explicitly", rendered)
+            audit = inspect_persisted_object(store, "audit")
+            assert audit is not None
+            suggested = [
+                event
+                for event in audit["audit_events"]
+                if event["event_type"] == "graph_template.suggested"
+            ]
+            self.assertEqual(len(suggested), 1)
+            self.assertEqual(suggested[0]["details"]["template_count"], 1)
+            self.assertEqual(
+                suggested[0]["details"]["suggestion"]["template_id"], TEMPLATE_ID
+            )
+            self.assertNotIn(
+                "graph_template.selected",
+                [event["event_type"] for event in audit["audit_events"]],
+            )
+
+    async def test_template_selection_must_match_a_listed_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = LocalStore(Path(temporary_directory) / "state")
+            executor = FakeExecutor(
+                OriginFitError("unused", "unused"),
+                transport=FakeTransport([]),
+            )
+            output = io.StringIO()
+
+            await run_agent_cli(
+                store,
+                SequenceModel([]),
+                executor,
+                stdin=io.StringIO(
+                    "/templates\n"
+                    f"/template template:other@1 {'0' * 64}\n"
+                    "/quit\n"
+                ),
+                stdout=output,
+            )
+
+            self.assertIn(
+                "Error [template_selection_rejected]", output.getvalue()
+            )
+            audit = inspect_persisted_object(store, "audit")
+            assert audit is not None
+            self.assertNotIn(
+                "graph_template.selected",
                 [event["event_type"] for event in audit["audit_events"]],
             )
 

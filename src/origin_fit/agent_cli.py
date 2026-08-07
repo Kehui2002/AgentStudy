@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import shlex
 from typing import Literal, Protocol, TextIO
 
 from mini_agent import Agent, Model, ModelResponse, ToolCallPart, ToolError
 
-from .contracts import WorkerJob
+from .contracts import WorkerCapabilities, WorkerJob
 from .datasets import inspect_dataset
 from .errors import OriginFitError
 from .execution import FitResult, accept_fit_result
@@ -36,13 +36,17 @@ class FitExecutor(Protocol):
 
 
 class WorkerControl(Protocol):
+    async def capabilities(self) -> WorkerCapabilities: ...
+
     async def status(self, worker_job_id: str) -> WorkerJob: ...
 
     async def cancel(self, worker_job_id: str) -> WorkerJob: ...
 
 
 def _proposal_tool(
-    store: LocalStore, dataset_snapshot_id: str
+    store: LocalStore,
+    dataset_snapshot_id: str,
+    selected_template: dict | None,
 ) -> Callable[..., dict[str, str]]:
     def propose_expdec2_fit(
         experiment_id: str,
@@ -54,6 +58,11 @@ def _proposal_tool(
     ) -> dict[str, str]:
         """Propose, but never approve, an ExpDec2 Fit Specification for the selected dataset."""
         try:
+            if selected_template is None:
+                raise OriginFitError(
+                    "template_selection_required",
+                    "Select a Registered Origin Graph Template explicitly before proposing a fit.",
+                )
             return propose_fit_specification(
                 store,
                 dataset_snapshot_id,
@@ -64,6 +73,9 @@ def _proposal_tool(
                 initialization=initialization,
                 graph_profile_id="expdec2-standard",
                 graph_profile_version="1.0",
+                template_id=selected_template["template_id"],
+                template_version=selected_template["version"],
+                template_sha256=selected_template["sha256"],
                 initial_values=initial_values,
             )
         except OriginFitError as error:
@@ -127,9 +139,18 @@ def _agent_prompt(
     dataset: dict,
     downsampled_preview: dict | None,
     latest_result_summary: dict | None,
+    available_templates: list[dict] | None = None,
 ) -> str:
     summary = dict(dataset["summary"])
     summary["preview_included"] = downsampled_preview is not None
+    registered_templates = [
+        {
+            "template_id": template["template_id"],
+            "version": template["version"],
+            "sha256": template["sha256"],
+        }
+        for template in (available_templates or [])
+    ]
     context = {
         "dataset_snapshot_id": dataset["dataset_snapshot_id"],
         "dataset_content_hash": dataset["content_hash"],
@@ -140,6 +161,10 @@ def _agent_prompt(
             "weighting": ["none", "instrument"],
             "initialization": ["origin_auto", "explicit"],
             "graph_profile": "expdec2-standard@1.0",
+            "graph_template": {
+                "selection": "explicit_user_action_required",
+                "registered_templates": registered_templates,
+            },
         },
     }
     if downsampled_preview is not None:
@@ -201,6 +226,8 @@ class _AgentCliSession:
     selected: dict | None = None
     downsampled_preview: dict | None = None
     latest_result_summary: dict | None = None
+    selected_template: dict | None = None
+    available_templates: list[dict] = field(default_factory=list)
 
     async def run(self, stdin: TextIO) -> None:
         for raw_line in stdin:
@@ -213,6 +240,12 @@ class _AgentCliSession:
             return False
         if line.startswith("select "):
             self._select_dataset(line.removeprefix("select ").strip())
+            return True
+        if line == "/templates":
+            await self._show_templates()
+            return True
+        if line.startswith("/template "):
+            self._select_template(line)
             return True
         if line == "/preview authorize":
             self._authorize_preview()
@@ -309,6 +342,115 @@ class _AgentCliSession:
         print(
             "Authorized a bounded downsampled preview "
             f"({self.downsampled_preview['preview_row_count']} rows).",
+            file=self.stdout,
+        )
+
+    async def _show_templates(self) -> None:
+        executor = self._require_executor()
+        if executor is None:
+            return
+        try:
+            capabilities = await executor.transport.capabilities()
+        except OriginFitError as error:
+            self._print_error(error)
+            return
+        self.available_templates = [
+            template.model_dump(mode="json")
+            for template in capabilities.graph_templates
+        ]
+        suggestion = self.available_templates[0] if self.available_templates else None
+        with self.store.connect() as connection:
+            self.store.audit(
+                connection,
+                "graph_template.suggested",
+                "worker",
+                {
+                    "suggestion": (
+                        {
+                            "template_id": suggestion["template_id"],
+                            "version": suggestion["version"],
+                            "sha256": suggestion["sha256"],
+                        }
+                        if suggestion is not None
+                        else None
+                    ),
+                    "template_count": len(self.available_templates),
+                },
+            )
+        for template in self.available_templates:
+            print(
+                f"Template {template['template_id']}@{template['version']} "
+                f"sha256={template['sha256']} "
+                f"profile={template['graph_profile']['id']}@"
+                f"{template['graph_profile']['version']}.",
+                file=self.stdout,
+            )
+        if suggestion is None:
+            print(
+                "No registered Origin graph templates are available.",
+                file=self.stdout,
+            )
+            return
+        print(
+            f"Suggestion only: {suggestion['template_id']}@"
+            f"{suggestion['version']}; you must still select it explicitly.",
+            file=self.stdout,
+        )
+
+    def _select_template(self, line: str) -> None:
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = []
+        if len(parts) != 3 or parts[0] != "/template":
+            print(
+                "Error [invalid_command]: Usage: /template TEMPLATE_ID@VERSION SHA256",
+                file=self.stdout,
+            )
+            return
+        template_reference = parts[1]
+        template_sha256 = parts[2]
+        if "@" not in template_reference:
+            print(
+                "Error [invalid_command]: Usage: /template TEMPLATE_ID@VERSION SHA256",
+                file=self.stdout,
+            )
+            return
+        template_id, raw_version = template_reference.rsplit("@", 1)
+        try:
+            version = int(raw_version)
+        except ValueError:
+            version = 0
+        reference = {
+            "template_id": template_id,
+            "version": version,
+            "sha256": template_sha256,
+        }
+        matches = [
+            template
+            for template in self.available_templates
+            if template["template_id"] == template_id
+            and template["version"] == version
+            and template["sha256"] == template_sha256
+        ]
+        if self.available_templates and not matches:
+            print(
+                "Error [template_selection_rejected]: Selection must match a listed "
+                "active template from /templates.",
+                file=self.stdout,
+            )
+            return
+        self.selected_template = reference
+        with self.store.connect() as connection:
+            self.store.audit(
+                connection,
+                "graph_template.selected",
+                template_id,
+                {"version": version, "sha256": template_sha256},
+            )
+        print(
+            f"Selected Registered Origin Graph Template {template_id}@{version} "
+            f"(sha256={template_sha256}).",
             file=self.stdout,
         )
 
@@ -433,13 +575,16 @@ class _AgentCliSession:
         selected = self._require_dataset()
         if selected is None:
             return
-        tool = _proposal_tool(self.store, selected["dataset_snapshot_id"])
+        tool = _proposal_tool(
+            self.store, selected["dataset_snapshot_id"], self.selected_template
+        )
         result = await Agent(self.model, tools=[tool]).run(
             _agent_prompt(
                 line,
                 selected,
                 self.downsampled_preview,
                 self.latest_result_summary,
+                self.available_templates,
             )
         )
         rejected_tools = [

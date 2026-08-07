@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -12,6 +13,7 @@ from origin_fit.execution import DeterministicFakeOriginAdapter
 from .api import create_app
 from .originpro_adapter import OriginProAdapter, OriginProAdapterError
 from .service import OriginWorker, WorkerError
+from .templates import GraphTemplateRegistry, TemplateError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,11 +29,90 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--keyfile", required=True, type=Path)
     serve.add_argument("--fake-origin", action="store_true")
     serve.add_argument("--origin-visible", action="store_true")
+    template = commands.add_parser("template")
+    template_commands = template.add_subparsers(dest="template_command", required=True)
+    register = template_commands.add_parser("register")
+    register.add_argument("--state-dir", required=True, type=Path)
+    register.add_argument("--name", required=True)
+    register.add_argument("--file", required=True, type=Path)
+    register.add_argument("--graph-profile", required=True)
+    register.add_argument("--originpro-min", required=True, type=float)
+    register.add_argument("--originpro-max", required=True, type=float)
+    for command_name in ("list", "show", "deactivate"):
+        subcommand = template_commands.add_parser(command_name)
+        subcommand.add_argument("--state-dir", required=True, type=Path)
+        if command_name in ("show", "deactivate"):
+            subcommand.add_argument("template_reference")
     return parser
+
+
+def _template_reference(value: str) -> tuple[str, int]:
+    if "@" not in value:
+        raise SystemExit(
+            "Template reference must be TEMPLATE_ID@VERSION, e.g. template:standard@1."
+        )
+    template_id, raw_version = value.rsplit("@", 1)
+    try:
+        version = int(raw_version)
+    except ValueError as error:
+        raise SystemExit(
+            "Template reference version must be an integer."
+        ) from error
+    if version < 1:
+        raise SystemExit("Template reference version must be at least 1.")
+    return template_id, version
+
+
+def _run_template_command(arguments: argparse.Namespace) -> int:
+    registry = GraphTemplateRegistry(arguments.state_dir)
+    try:
+        if arguments.template_command == "register":
+            profile_id, profile_version = arguments.graph_profile.rsplit("@", 1)
+            if not profile_id or not profile_version:
+                raise TemplateError(
+                    "invalid_template_metadata",
+                    "--graph-profile requires PROFILE_ID@VERSION.",
+                )
+            try:
+                content = arguments.file.read_bytes()
+            except OSError as error:
+                raise TemplateError(
+                    "template_unreadable",
+                    "Registered Origin Graph Template file could not be read.",
+                ) from error
+            result = registry.register(
+                name=arguments.name,
+                content=content,
+                filename=arguments.file.name,
+                graph_profile_id=profile_id,
+                graph_profile_version=profile_version,
+                originpro_min_version=arguments.originpro_min,
+                originpro_max_version=arguments.originpro_max,
+            )
+        elif arguments.template_command == "list":
+            result = {"graph_templates": registry.list_templates()}
+        else:
+            template_id, version = _template_reference(arguments.template_reference)
+            if arguments.template_command == "show":
+                shown = registry.get(template_id, version)
+                if shown is None:
+                    raise TemplateError(
+                        "template_not_found",
+                        f"Registered Origin Graph Template '{template_id}@{version}' not found.",
+                    )
+                result = shown
+            else:
+                result = registry.deactivate(template_id, version)
+    except TemplateError as error:
+        raise SystemExit(f"{error.code}: {error.message}") from error
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.command == "template":
+        return _run_template_command(arguments)
     try:
         host = ipaddress.ip_address(arguments.host)
         host_only_network = ipaddress.ip_network(
